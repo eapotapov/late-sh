@@ -7,14 +7,15 @@ use tokio::sync::{Mutex, broadcast, watch};
 use uuid::Uuid;
 
 use crate::app::{
-    games::{cards::PlayingCard, chips::svc::ChipService},
+    activity::{event::ActivityGame, publisher::ActivityPublisher},
+    arcade::{cards::PlayingCard, chips::svc::ChipService},
     rooms::blackjack::{
         player::{BlackjackPlayerDirectory, BlackjackPlayerInfo},
         settings::BlackjackTableSettings,
         state::{
-            Bet, BlackjackSeat, BlackjackSnapshot, MAX_SEATS, Outcome, Phase, SeatAction,
-            SeatPhase, Shoe, can_double, dealer_must_hit, is_bust, is_natural_blackjack,
-            payout_credit, score, settle,
+            Bet, BlackjackSeat, BlackjackSnapshot, MAX_SEATS, Outcome, Phase,
+            SETTLEMENT_MIN_VIEW_MS, SeatAction, SeatPhase, Shoe, can_double, dealer_must_hit,
+            is_bust, is_natural_blackjack, payout_credit, score, settle,
         },
     },
 };
@@ -22,8 +23,7 @@ use crate::app::{
 const BETTING_LOCK_CAP_SECS: u64 = 30;
 const MAX_MISSED_DEALS: u8 = 3;
 const SEAT_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
-const DEALER_CARD_DELAY_MS: u64 = 1100;
-const SETTLEMENT_MIN_VIEW_MS: u64 = 1500;
+const DEALER_CARD_DELAY_MS: u64 = 900;
 
 #[derive(Clone)]
 pub struct BlackjackService {
@@ -33,6 +33,7 @@ pub struct BlackjackService {
     snapshot_tx: watch::Sender<BlackjackSnapshot>,
     snapshot_rx: watch::Receiver<BlackjackSnapshot>,
     event_tx: broadcast::Sender<BlackjackEvent>,
+    activity: ActivityPublisher,
     table: Arc<Mutex<SharedTableState>>,
 }
 
@@ -184,17 +185,23 @@ struct DoubleDownSuccess {
 }
 
 impl BlackjackService {
+    pub fn room_id(&self) -> Uuid {
+        self.room_id
+    }
+
     pub fn new(
         room_id: Uuid,
         chip_svc: ChipService,
         player_directory: BlackjackPlayerDirectory,
         event_tx: broadcast::Sender<BlackjackEvent>,
+        activity: ActivityPublisher,
     ) -> Self {
         Self::new_with_settings(
             room_id,
             chip_svc,
             player_directory,
             event_tx,
+            activity,
             BlackjackTableSettings::default(),
         )
     }
@@ -204,6 +211,7 @@ impl BlackjackService {
         chip_svc: ChipService,
         player_directory: BlackjackPlayerDirectory,
         event_tx: broadcast::Sender<BlackjackEvent>,
+        activity: ActivityPublisher,
         settings: BlackjackTableSettings,
     ) -> Self {
         let table = SharedTableState::new(settings);
@@ -216,6 +224,7 @@ impl BlackjackService {
             snapshot_tx,
             snapshot_rx,
             event_tx,
+            activity,
             table: Arc::new(Mutex::new(table)),
         }
     }
@@ -226,10 +235,6 @@ impl BlackjackService {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<BlackjackEvent> {
         self.event_tx.subscribe()
-    }
-
-    pub fn room_id(&self) -> Uuid {
-        self.room_id
     }
 
     pub fn current_snapshot(&self) -> BlackjackSnapshot {
@@ -1041,6 +1046,17 @@ impl BlackjackService {
                 credit: settlement.credit,
                 new_balance,
             });
+            if matches!(
+                settlement.outcome,
+                Outcome::PlayerBlackjack | Outcome::PlayerWin
+            ) {
+                self.activity.game_won_task(
+                    settlement.user_id,
+                    ActivityGame::Blackjack,
+                    Some(format!("bet {}", settlement.bet)),
+                    None,
+                );
+            }
         }
         Ok(())
     }
@@ -1992,7 +2008,7 @@ impl SharedTableState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::games::cards::{CardRank, CardSuit, PlayingCard};
+    use crate::app::arcade::cards::{CardRank, CardSuit, PlayingCard};
     use crate::app::rooms::blackjack::state::MIN_BET;
 
     fn user_id() -> Uuid {

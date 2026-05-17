@@ -34,7 +34,7 @@ use crate::authz::{Caps, Permissions, Tier};
 use crate::metrics;
 use crate::moderation::event::ModerationEvent;
 use crate::moderation::service::{
-    ModerationService, ensure_message_permission, target_tier_for_user_id,
+    ModerationInfra, ModerationService, ensure_message_permission, target_tier_for_user_id,
 };
 use crate::moderation::session_effects::ModerationSessionEffects;
 use crate::session::SessionRegistry;
@@ -56,7 +56,7 @@ pub struct ChatService {
     notification_svc: super::notifications::svc::NotificationService,
     active_users: Option<ActiveUsers>,
     session_registry: Option<SessionRegistry>,
-    force_admin: bool,
+    moderation_infra: ModerationInfra,
     username_refresh_started: Arc<AtomicBool>,
     refresh_sessions: Arc<Mutex<HashMap<Uuid, ChatRefreshSession>>>,
     refresh_scheduler_started: Arc<AtomicBool>,
@@ -82,6 +82,27 @@ pub struct SendMessageTask {
     pub reply_to_message_id: Option<Uuid>,
     pub request_id: Uuid,
     pub is_admin: bool,
+}
+
+pub struct SendGeneralMessageTask {
+    pub user_id: Uuid,
+    pub body: String,
+    pub request_id: Option<Uuid>,
+    pub join_if_needed: bool,
+    pub failure_log: &'static str,
+}
+
+fn send_error_message(error: &anyhow::Error) -> &'static str {
+    let error = error.to_string();
+    if error.contains("not a member") {
+        "You are not a member of this room."
+    } else if error.contains("banned from this room") {
+        "You are banned from this room."
+    } else if error.contains("admin-only") {
+        "Only admins can post in #announcements."
+    } else {
+        "Could not send message. Please try again."
+    }
 }
 
 #[derive(Clone)]
@@ -312,7 +333,7 @@ impl ChatService {
             notification_svc,
             active_users: None,
             session_registry: None,
-            force_admin: false,
+            moderation_infra: ModerationInfra::default(),
             username_refresh_started: Arc::new(AtomicBool::new(false)),
             refresh_sessions: Arc::new(Mutex::new(HashMap::new())),
             refresh_scheduler_started: Arc::new(AtomicBool::new(false)),
@@ -338,7 +359,12 @@ impl ChatService {
     }
 
     pub fn with_force_admin(mut self, force_admin: bool) -> Self {
-        self.force_admin = force_admin;
+        self.moderation_infra = self.moderation_infra.with_force_admin(force_admin);
+        self
+    }
+
+    pub fn with_moderation_infra(mut self, moderation_infra: ModerationInfra) -> Self {
+        self.moderation_infra = moderation_infra;
         self
     }
 
@@ -396,7 +422,7 @@ impl ChatService {
             self.db.clone(),
             self.moderation_session_effects(),
             self.moderation_event_tx.clone(),
-            self.force_admin,
+            self.moderation_infra.clone(),
         )
     }
 
@@ -931,15 +957,7 @@ impl ChatService {
                     .await
                 {
                     Err(e) => {
-                        let message = if e.to_string().contains("not a member") {
-                            "You are not a member of this room."
-                        } else if e.to_string().contains("banned from this room") {
-                            "You are banned from this room."
-                        } else if e.to_string().contains("admin-only") {
-                            "Only admins can post in #announcements."
-                        } else {
-                            "Could not send message. Please try again."
-                        };
+                        let message = send_error_message(&e);
                         let _ = service.evt_tx.send(ChatEvent::SendFailed {
                             user_id,
                             request_id,
@@ -966,6 +984,72 @@ impl ChatService {
                 request_id = %request_id
             )),
         );
+    }
+
+    pub fn send_general_message_task(&self, task: SendGeneralMessageTask) {
+        let SendGeneralMessageTask {
+            user_id,
+            body,
+            request_id,
+            join_if_needed,
+            failure_log,
+        } = task;
+        let service = self.clone();
+        tokio::spawn(
+            async move {
+                match service
+                    .send_general_message(user_id, body, join_if_needed)
+                    .await
+                {
+                    Ok(()) => {
+                        if let Some(request_id) = request_id {
+                            let _ = service.evt_tx.send(ChatEvent::SendSucceeded {
+                                user_id,
+                                request_id,
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(request_id) = request_id {
+                            let message = send_error_message(&e);
+                            let _ = service.evt_tx.send(ChatEvent::SendFailed {
+                                user_id,
+                                request_id,
+                                message: message.to_string(),
+                            });
+                        }
+                        tracing::warn!(error = ?e, %user_id, failure_log);
+                    }
+                }
+            }
+            .instrument(info_span!("chat.send_general_message_task", user_id = %user_id)),
+        );
+    }
+
+    async fn send_general_message(
+        &self,
+        user_id: Uuid,
+        body: String,
+        join_if_needed: bool,
+    ) -> Result<()> {
+        let client = self.db.get().await?;
+        let room = ChatRoom::find_general(&client)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("general room not found"))?;
+        if join_if_needed {
+            ChatRoomMember::join(&client, room.id, user_id).await?;
+        }
+        drop(client);
+
+        self.send_message(
+            user_id,
+            room.id,
+            Some("general".to_string()),
+            body,
+            None,
+            false,
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self, body), fields(user_id = %user_id, room_id = %room_id, body_len = body.len()))]
@@ -1113,16 +1197,7 @@ impl ChatService {
         ensure_message_permission(permissions, is_owner, Caps::EDIT_OTHER_MESSAGE, target_tier)?;
 
         let tx = client.transaction().await?;
-        let row = tx
-            .query_one(
-                "UPDATE chat_messages
-                 SET body = $1, updated = current_timestamp
-                 WHERE id = $2
-                 RETURNING *",
-                &[&new_body, &message_id],
-            )
-            .await?;
-        let updated = ChatMessage::from(row);
+        let updated = ChatMessage::edit_after_authorization(&tx, message_id, new_body).await?;
         ModerationAuditLog::record_if(
             &tx,
             permissions.should_audit(is_owner),
@@ -1171,11 +1246,16 @@ impl ChatService {
         );
     }
 
-    pub fn toggle_message_pin_task(&self, message_id: Uuid, is_admin: bool) {
+    pub fn toggle_message_pin_task(
+        &self,
+        message_id: Uuid,
+        is_admin: bool,
+        pinned_tx: watch::Sender<Vec<ChatMessage>>,
+    ) {
         let service = self.clone();
         tokio::spawn(
             async move {
-                let result: Result<()> = async {
+                let result: Result<Vec<ChatMessage>> = async {
                     if !is_admin {
                         anyhow::bail!("admin-only");
                     }
@@ -1184,15 +1264,19 @@ impl ChatService {
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("message not found"))?;
                     ChatMessage::set_pinned(&client, message_id, !message.pinned).await?;
-                    Ok(())
+                    let pinned = ChatMessage::list_pinned(&client, PINNED_MESSAGES_LIMIT).await?;
+                    Ok(pinned)
                 }
                 .await;
-                if let Err(e) = result {
-                    late_core::error_span!(
+                match result {
+                    Ok(pinned) => {
+                        let _ = pinned_tx.send(pinned);
+                    }
+                    Err(e) => late_core::error_span!(
                         "chat_pin_failed",
                         error = ?e,
                         "failed to toggle message pin"
-                    );
+                    ),
                 }
             }
             .instrument(info_span!(
@@ -1948,14 +2032,9 @@ impl ChatService {
         )?;
         let tx = client.transaction().await?;
         let count = if is_owner {
-            tx.execute(
-                "DELETE FROM chat_messages WHERE id = $1 AND user_id = $2",
-                &[&message_id, &user_id],
-            )
-            .await?
+            ChatMessage::delete_by_author(&tx, message_id, user_id).await?
         } else {
-            tx.execute("DELETE FROM chat_messages WHERE id = $1", &[&message_id])
-                .await?
+            ChatMessage::delete_by_admin(&tx, message_id).await?
         };
         if count == 0 {
             anyhow::bail!("Cannot delete this message");

@@ -17,6 +17,7 @@ pub struct State {
     unread_count: i64,
     last_read_at: Option<DateTime<Utc>>,
     marker_read_at: Option<DateTime<Utc>>,
+    preserve_marker_read_at: bool,
 }
 
 impl State {
@@ -34,6 +35,7 @@ impl State {
             unread_count: 0,
             last_read_at: None,
             marker_read_at: None,
+            preserve_marker_read_at: false,
         }
     }
 
@@ -43,6 +45,9 @@ impl State {
 
     pub fn list(&self) {
         self.service.list_task(self.user_id);
+    }
+
+    pub fn refresh_unread_count(&self) {
         self.service.refresh_unread_count_task(self.user_id);
     }
 
@@ -68,6 +73,7 @@ impl State {
 
     pub fn mark_read(&mut self) {
         self.marker_read_at = self.last_read_at;
+        self.preserve_marker_read_at = true;
         self.unread_count = 0;
         self.service.mark_all_read_task(self.user_id);
     }
@@ -99,6 +105,9 @@ impl State {
                     } if user_id == self.user_id => {
                         self.unread_count = unread_count;
                         self.last_read_at = last_read_at;
+                        if unread_count == 0 && !self.preserve_marker_read_at {
+                            self.marker_read_at = last_read_at;
+                        }
                     }
                     NotificationEvent::NewMention {
                         user_id,

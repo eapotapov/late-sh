@@ -56,18 +56,29 @@ late.sh      → <server-ip>
 *.late.sh    → <server-ip>
 ```
 
+For IPv6, configure matching AAAA records to the node IPv6 address. The
+Terraform-managed `ipv6-proxy` DaemonSet binds only that IPv6 address and
+forwards traffic into the existing IPv4 ingress path.
+
 This enables:
 - `ssh late.sh` — SSH TUI
 - `https://late.sh` — Web landing + audio pairing
 - `https://api.late.sh` — SSH API / WebSocket
 - `https://audio.late.sh` — Icecast audio stream
+- `https://files.late.sh` — Public uploaded chat files (R2 custom domain)
 - `https://grafana.late.sh` — Monitoring
 
 ### 5. Set Up S3 Buckets
 
-Create two buckets in your S3-compatible provider:
+Create the required buckets in your S3-compatible provider:
 - `{context}-tf-state` — Terraform state
 - `{context}-db-backups` — Database backups
+
+Optionally create a files bucket for public chat uploads:
+- `{context}-files` — Public uploaded chat files
+
+For Cloudflare R2, attach a custom domain such as `files.<domain>` to the
+files bucket and set `FILES_PUBLIC_BASE_URL` to that exact public base URL.
 
 ### 6. Deploy
 
@@ -144,6 +155,14 @@ All parameters are set as Terraform variables (via GitHub secrets/variables for 
 | `WS_PAIR_RATE_LIMIT_WINDOW_SECS` | WebSocket pair rate limit window in seconds |
 | `DB_POOL_SIZE` | Database connection pool size |
 
+### IPv6 edge proxy
+
+| Variable | Description |
+|----------|-------------|
+| `IPV6_PROXY_ENABLED` | Deploy the host-network IPv6-only HAProxy edge proxy |
+| `IPV6_PROXY_ADDRESS` | Public IPv6 address for the proxy to bind |
+| `IPV6_PROXY_IMAGE` | HAProxy image used by the proxy |
+
 ### AI (Gemini)
 
 | Variable | Description |
@@ -166,6 +185,9 @@ All parameters are set as Terraform variables (via GitHub secrets/variables for 
 | `S3_SECRET_ACCESS_KEY` | S3 secret key |
 | `S3_ENDPOINT` | S3 endpoint URL |
 | `DB_BACKUPS_BUCKET` | Bucket for CloudNativePG backups |
+| `FILES_BUCKET` | Bucket for public uploaded chat files |
+| `FILES_PUBLIC_BASE_URL` | Public base URL for uploaded files |
+| `FILES_S3_REGION` | S3 signing region for file uploads, defaults to `auto` for R2 |
 
 ## Production Considerations
 

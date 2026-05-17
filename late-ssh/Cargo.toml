@@ -23,6 +23,7 @@ ipnet.workspace = true
 
 # Async Runtime
 tokio = { workspace = true }
+futures-util = { workspace = true }
 
 # Memory allocator
 tikv-jemallocator = "0.6"
@@ -43,6 +44,9 @@ getrandom.workspace = true
 rand_core = { workspace = true, features = ["std"] }
 base64.workspace = true
 bitflags.workspace = true
+hex.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 vte.workspace = true
 pkcs5.workspace = true
 russh.workspace = true
@@ -59,6 +63,7 @@ rumenx-sudoku.workspace = true
 opentelemetry = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 opentelemetry-http = { workspace = true, optional = true }
+rand.workspace = true
 
 [dev-dependencies]
 late-core = { workspace = true, features = ["testing"] }

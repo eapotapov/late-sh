@@ -1,37 +1,34 @@
 use std::cell::Cell;
 
 use late_core::models::profile::{Profile, ProfileParams, normalize_profile_tags};
+use late_core::models::rss_feed::RssFeed;
 use late_core::models::user::sanitize_username_input;
 use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
+use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 use crate::app::common::theme;
 use crate::app::profile::svc::ProfileService;
+use crate::app::{
+    chat::feeds::svc::{FeedEvent, FeedService, FeedSnapshot},
+    common::primitives::Banner,
+};
 
 use super::data::{CountryOption, filter_countries, filter_timezones};
 use super::gem::GemState;
 
 const USERNAME_MAX_LEN: usize = 12;
+const DELETE_CONFIRM_USERNAME_MAX_LEN: usize = late_core::models::user::USERNAME_MAX_LEN;
 const SYSTEM_FIELD_MAX_LEN: usize = 48;
-pub const BIO_MAX_LEN: usize = 500;
+const FEED_URL_MAX_LEN: usize = 2000;
+pub const BIO_MAX_LEN: usize = 1000;
+pub const DELETE_CONFIRM_MISMATCH: &str = "Typed username does not match current username.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PickerKind {
     Country,
     Timezone,
-    Room,
-}
-
-/// Snapshot of one room the user is a member of, flattened to the minimum
-/// the modal needs to render + filter. Built by the caller (dashboard/chat
-/// code has access to slug/kind/DM peer usernames), so this module stays
-/// decoupled from `ChatRoom` and `usernames` lookups.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RoomOption {
-    pub id: Uuid,
-    /// Display label: e.g. `"#general"`, `"#rust-nerds"`, `"@alice"`.
-    pub label: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,10 +40,10 @@ pub enum Row {
     Langs,
     Theme,
     BackgroundColor,
-    DashboardHeader,
-    DashboardRoomShowcases,
     RightSidebar,
-    GamesSidebar,
+    RoomListSidebar,
+    LoungeInfo,
+    WireBox,
     Country,
     Timezone,
     DirectMessages,
@@ -66,10 +63,10 @@ impl Row {
         Row::Langs,
         Row::Theme,
         Row::BackgroundColor,
-        Row::DashboardHeader,
-        Row::DashboardRoomShowcases,
         Row::RightSidebar,
-        Row::GamesSidebar,
+        Row::RoomListSidebar,
+        Row::LoungeInfo,
+        Row::WireBox,
         Row::Country,
         Row::Timezone,
         Row::DirectMessages,
@@ -124,25 +121,26 @@ impl SystemField {
 /// Top-level tab in the settings modal. `Settings` holds every compact row
 /// (identity/appearance/location/notifications); `Themes` is a fast browser
 /// for the expanded theme catalog; `Bio` is a separate full-width pane with
-/// the markdown editor + preview; `Favorites` manages the dashboard
-/// quick-switch room list.
+/// the markdown editor + preview.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tab {
     Settings,
     Bio,
     Themes,
-    Favorites,
+    Account,
+    Feeds,
     /// Hidden until the user has filled out at least one of bio, country,
     /// or timezone. Currently houses the "Show settings on connect" toggle.
     Special,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Settings,
         Tab::Bio,
         Tab::Themes,
-        Tab::Favorites,
+        Tab::Feeds,
+        Tab::Account,
         Tab::Special,
     ];
 
@@ -151,7 +149,8 @@ impl Tab {
             Tab::Settings => "Settings",
             Tab::Bio => "Bio",
             Tab::Themes => "Themes",
-            Tab::Favorites => "Favorites",
+            Tab::Account => "Account",
+            Tab::Feeds => "RSS",
             Tab::Special => "Special",
         }
     }
@@ -178,8 +177,43 @@ pub struct PickerState {
     pub visible_height: Cell<usize>,
 }
 
+pub struct DeleteAccountDialogState {
+    open: bool,
+    input: TextArea<'static>,
+    status: Option<String>,
+    pending: bool,
+}
+
+impl DeleteAccountDialogState {
+    fn new() -> Self {
+        Self {
+            open: false,
+            input: new_short_textarea(false),
+            status: None,
+            pending: false,
+        }
+    }
+
+    pub fn open(&self) -> bool {
+        self.open
+    }
+
+    pub fn input(&self) -> &TextArea<'static> {
+        &self.input
+    }
+
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+}
+
 pub struct SettingsModalState {
     profile_service: ProfileService,
+    feed_service: FeedService,
     user_id: Uuid,
     draft: Profile,
     selected_tab: Tab,
@@ -196,21 +230,26 @@ pub struct SettingsModalState {
     editing_bio: bool,
     bio_input: TextArea<'static>,
     picker: PickerState,
-    /// Catalog of rooms the user can pick favorites from. Re-supplied on
-    /// every modal open so we always reflect current membership.
-    available_rooms: Vec<RoomOption>,
-    /// Cursor in the Favorites tab: 0..favorites.len() selects a favorite,
-    /// the final slot (favorites.len()) selects the "Add favorite…" row.
-    favorites_index: usize,
+    delete_account: DeleteAccountDialogState,
+    feeds: Vec<RssFeed>,
+    feed_index: usize,
+    editing_feed_url: bool,
+    feed_url_input: TextArea<'static>,
+    feed_snapshot_rx: watch::Receiver<FeedSnapshot>,
+    feed_event_rx: broadcast::Receiver<FeedEvent>,
     /// Per-session gem easter egg on the Special tab. Persists across modal
     /// open/close cycles for the lifetime of the SSH session.
     gem: GemState,
 }
 
 impl SettingsModalState {
-    pub fn new(profile_service: ProfileService, user_id: Uuid) -> Self {
+    pub fn new(profile_service: ProfileService, feed_service: FeedService, user_id: Uuid) -> Self {
+        let feed_snapshot_rx = feed_service.subscribe_snapshot();
+        let feed_event_rx = feed_service.subscribe_events();
+        feed_service.list_task(user_id);
         Self {
             profile_service,
+            feed_service,
             user_id,
             draft: Profile::default(),
             selected_tab: Tab::Settings,
@@ -227,8 +266,13 @@ impl SettingsModalState {
             editing_bio: false,
             bio_input: new_bio_textarea(false),
             picker: PickerState::default(),
-            available_rooms: Vec::new(),
-            favorites_index: 0,
+            delete_account: DeleteAccountDialogState::new(),
+            feeds: Vec::new(),
+            feed_index: 0,
+            editing_feed_url: false,
+            feed_url_input: new_short_textarea(false),
+            feed_snapshot_rx,
+            feed_event_rx,
             gem: GemState::new(),
         }
     }
@@ -241,15 +285,8 @@ impl SettingsModalState {
         &mut self.gem
     }
 
-    pub fn open_from_profile(
-        &mut self,
-        profile: &Profile,
-        available_rooms: Vec<RoomOption>,
-        _modal_width: u16,
-    ) {
+    pub fn open_from_profile(&mut self, profile: &Profile) {
         self.draft = profile.clone();
-        prune_favorites_against_loaded_rooms(&mut self.draft.favorite_room_ids, &available_rooms);
-        self.available_rooms = available_rooms;
         self.selected_tab = Tab::Settings;
         self.row_index = 0;
         self.sync_theme_index_to_draft();
@@ -260,7 +297,13 @@ impl SettingsModalState {
         self.editing_bio = false;
         self.bio_input = bio_textarea_for_readonly_text(&self.draft.bio);
         self.picker = PickerState::default();
-        self.favorites_index = 0;
+        self.delete_account = DeleteAccountDialogState::new();
+        self.feed_service.list_task(self.user_id);
+    }
+
+    pub fn tick(&mut self) -> Option<Banner> {
+        self.drain_feed_snapshot();
+        self.drain_feed_events()
     }
 
     pub fn selected_tab(&self) -> Tab {
@@ -294,6 +337,9 @@ impl SettingsModalState {
         if self.selected_tab == Tab::Settings && self.editing_system_field.is_some() {
             self.submit_system_field();
             self.save();
+        }
+        if self.selected_tab == Tab::Feeds && self.editing_feed_url {
+            self.cancel_feed_url_edit();
         }
         if next == Tab::Themes {
             self.sync_theme_index_to_draft();
@@ -346,6 +392,99 @@ impl SettingsModalState {
 
     pub fn selected_row(&self) -> Row {
         Row::ALL[self.row_index]
+    }
+
+    pub fn delete_account_dialog(&self) -> &DeleteAccountDialogState {
+        &self.delete_account
+    }
+
+    pub fn open_delete_account_dialog(&mut self) {
+        self.delete_account.open = true;
+        self.delete_account.input = new_short_textarea(true);
+        self.delete_account.status = None;
+        self.delete_account.pending = false;
+    }
+
+    pub fn close_delete_account_dialog(&mut self) {
+        self.delete_account = DeleteAccountDialogState::new();
+    }
+
+    pub fn submit_delete_account_confirmation(&mut self) {
+        if self.delete_account.pending {
+            return;
+        }
+        let typed = self.delete_account_text();
+        if typed != self.draft.username {
+            self.delete_account.status = Some(DELETE_CONFIRM_MISMATCH.to_string());
+            return;
+        }
+        self.delete_account.pending = true;
+        self.delete_account.status = Some("Deleting account...".to_string());
+        self.profile_service.delete_account(self.user_id);
+    }
+
+    pub fn delete_account_push(&mut self, ch: char) {
+        if delete_account_char_count_for_input(&self.delete_account.input)
+            < DELETE_CONFIRM_USERNAME_MAX_LEN
+        {
+            self.delete_account.input.insert_char(ch);
+            self.delete_account.status = None;
+        }
+    }
+
+    pub fn delete_account_backspace(&mut self) {
+        self.delete_account.input.delete_char();
+        self.delete_account.status = None;
+    }
+
+    pub fn delete_account_delete_right(&mut self) {
+        self.delete_account.input.delete_next_char();
+        self.delete_account.status = None;
+    }
+
+    pub fn delete_account_delete_word_left(&mut self) {
+        self.delete_account.input.delete_word();
+        self.delete_account.status = None;
+    }
+
+    pub fn delete_account_delete_word_right(&mut self) {
+        self.delete_account.input.delete_next_word();
+        self.delete_account.status = None;
+    }
+
+    pub fn delete_account_cursor_left(&mut self) {
+        self.delete_account.input.move_cursor(CursorMove::Back);
+    }
+
+    pub fn delete_account_cursor_right(&mut self) {
+        self.delete_account.input.move_cursor(CursorMove::Forward);
+    }
+
+    pub fn delete_account_cursor_word_left(&mut self) {
+        self.delete_account.input.move_cursor(CursorMove::WordBack);
+    }
+
+    pub fn delete_account_cursor_word_right(&mut self) {
+        self.delete_account
+            .input
+            .move_cursor(CursorMove::WordForward);
+    }
+
+    pub fn delete_account_cursor_home(&mut self) {
+        self.delete_account.input.move_cursor(CursorMove::Head);
+    }
+
+    pub fn delete_account_cursor_end(&mut self) {
+        self.delete_account.input.move_cursor(CursorMove::End);
+    }
+
+    pub fn clear_delete_account_confirmation(&mut self) {
+        self.delete_account.input = new_short_textarea(true);
+        self.delete_account.status = None;
+    }
+
+    pub fn delete_account_text(&self) -> String {
+        self.delete_account.input.lines().join("")
     }
 
     pub fn move_row(&mut self, delta: isize) {
@@ -606,6 +745,22 @@ impl SettingsModalState {
         &self.bio_input
     }
 
+    pub fn feeds(&self) -> &[RssFeed] {
+        &self.feeds
+    }
+
+    pub fn feed_index(&self) -> usize {
+        self.feed_index
+    }
+
+    pub fn editing_feed_url(&self) -> bool {
+        self.editing_feed_url
+    }
+
+    pub fn feed_url_input(&self) -> &TextArea<'static> {
+        &self.feed_url_input
+    }
+
     fn bio_text(&self) -> String {
         self.bio_input.lines().join("\n")
     }
@@ -646,25 +801,10 @@ impl SettingsModalState {
         filter_timezones(&self.picker.query)
     }
 
-    /// Rooms the user is a member of but hasn't favorited yet, filtered by
-    /// the picker's current query. Returns references into `available_rooms`
-    /// so we don't clone the label on every keystroke.
-    pub fn filtered_rooms(&self) -> Vec<&RoomOption> {
-        let query = self.picker.query.trim().to_ascii_lowercase();
-        let favorited: std::collections::HashSet<&Uuid> =
-            self.draft.favorite_room_ids.iter().collect();
-        self.available_rooms
-            .iter()
-            .filter(|room| !favorited.contains(&room.id))
-            .filter(|room| query.is_empty() || room.label.to_ascii_lowercase().contains(&query))
-            .collect()
-    }
-
     pub fn picker_len(&self) -> usize {
         match self.picker.kind {
             Some(PickerKind::Country) => self.filtered_countries().len(),
             Some(PickerKind::Timezone) => self.filtered_timezones().len(),
-            Some(PickerKind::Room) => self.filtered_rooms().len(),
             None => 0,
         }
     }
@@ -705,19 +845,6 @@ impl SettingsModalState {
                 let options = self.filtered_countries();
                 if let Some(country) = options.get(self.picker.selected_index) {
                     self.draft.country = Some(country.code.to_string());
-                    mutated = true;
-                }
-            }
-            Some(PickerKind::Room) => {
-                let chosen_id = self
-                    .filtered_rooms()
-                    .get(self.picker.selected_index)
-                    .map(|room| room.id);
-                if let Some(id) = chosen_id {
-                    self.draft.favorite_room_ids.push(id);
-                    // Leave cursor on the freshly-added entry so follow-up
-                    // reorders feel continuous.
-                    self.favorites_index = self.draft.favorite_room_ids.len().saturating_sub(1);
                     mutated = true;
                 }
             }
@@ -959,6 +1086,14 @@ impl SettingsModalState {
         self.bio_input.move_cursor(CursorMove::WordForward);
     }
 
+    pub fn bio_cursor_home(&mut self) {
+        self.bio_input.move_cursor(CursorMove::Head);
+    }
+
+    pub fn bio_cursor_end(&mut self) {
+        self.bio_input.move_cursor(CursorMove::End);
+    }
+
     pub fn bio_paste(&mut self) {
         let yank = self.bio_input.yank_text();
         insert_bio_text_limited(&mut self.bio_input, &yank);
@@ -972,75 +1107,154 @@ impl SettingsModalState {
         self.bio_input = new_bio_textarea(self.editing_bio);
     }
 
-    pub fn favorites(&self) -> &[Uuid] {
-        &self.draft.favorite_room_ids
+    pub fn move_feed_cursor(&mut self, delta: isize) {
+        let len = self.feed_slot_count();
+        if len == 0 {
+            self.feed_index = 0;
+            return;
+        }
+        self.feed_index = (self.feed_index as isize + delta).clamp(0, len as isize - 1) as usize;
     }
 
-    pub fn available_rooms(&self) -> &[RoomOption] {
-        &self.available_rooms
+    pub fn feed_slot_count(&self) -> usize {
+        self.feeds.len() + 1
     }
 
-    /// Number of navigable slots on the Favorites tab: every pinned room
-    /// plus the trailing "Add favorite…" row.
-    pub fn favorites_slot_count(&self) -> usize {
-        self.draft.favorite_room_ids.len() + 1
+    pub fn feed_index_is_add_row(&self) -> bool {
+        self.feed_index == self.feeds.len()
     }
 
-    pub fn favorites_index(&self) -> usize {
-        self.favorites_index
+    pub fn start_feed_url_edit(&mut self) {
+        self.editing_feed_url = true;
+        self.feed_url_input = new_short_textarea(true);
     }
 
-    pub fn favorites_index_is_add_row(&self) -> bool {
-        self.favorites_index == self.draft.favorite_room_ids.len()
+    pub fn cancel_feed_url_edit(&mut self) {
+        self.editing_feed_url = false;
+        self.feed_url_input = new_short_textarea(false);
     }
 
-    pub fn room_label(&self, room_id: Uuid) -> Option<&str> {
-        self.available_rooms
+    pub fn submit_feed_url(&mut self) {
+        let url = self.feed_url_input.lines().join("").trim().to_string();
+        self.cancel_feed_url_edit();
+        if url.is_empty() {
+            return;
+        }
+        self.feed_service.add_feed_task(self.user_id, url);
+    }
+
+    pub fn remove_selected_feed(&mut self) {
+        if self.feed_index_is_add_row() {
+            return;
+        }
+        let Some(feed) = self.feeds.get(self.feed_index) else {
+            return;
+        };
+        self.feed_service.delete_feed_task(self.user_id, feed.id);
+    }
+
+    pub fn refresh_feeds(&self) {
+        self.feed_service.poll_once_task();
+        self.feed_service.list_task(self.user_id);
+    }
+
+    pub fn feed_push(&mut self, ch: char) {
+        if self.feed_url_char_count() < FEED_URL_MAX_LEN {
+            self.feed_url_input.insert_char(ch);
+        }
+    }
+
+    pub fn feed_backspace(&mut self) {
+        self.feed_url_input.delete_char();
+    }
+
+    pub fn feed_delete_right(&mut self) {
+        self.feed_url_input.delete_next_char();
+    }
+
+    pub fn feed_cursor_left(&mut self) {
+        self.feed_url_input.move_cursor(CursorMove::Back);
+    }
+
+    pub fn feed_cursor_right(&mut self) {
+        self.feed_url_input.move_cursor(CursorMove::Forward);
+    }
+
+    pub fn feed_cursor_word_left(&mut self) {
+        self.feed_url_input.move_cursor(CursorMove::WordBack);
+    }
+
+    pub fn feed_cursor_word_right(&mut self) {
+        self.feed_url_input.move_cursor(CursorMove::WordForward);
+    }
+
+    pub fn feed_cursor_home(&mut self) {
+        self.feed_url_input.move_cursor(CursorMove::Head);
+    }
+
+    pub fn feed_cursor_end(&mut self) {
+        self.feed_url_input.move_cursor(CursorMove::End);
+    }
+
+    pub fn feed_clear(&mut self) {
+        self.feed_url_input = new_short_textarea(self.editing_feed_url);
+    }
+
+    pub fn feed_paste(&mut self) {
+        let yank = self.feed_url_input.yank_text();
+        for ch in yank.chars() {
+            if !ch.is_control() && ch != '\n' && ch != '\r' {
+                self.feed_push(ch);
+            }
+        }
+    }
+
+    pub fn feed_undo(&mut self) {
+        self.feed_url_input.undo();
+    }
+
+    fn feed_url_char_count(&self) -> usize {
+        self.feed_url_input
+            .lines()
             .iter()
-            .find(|room| room.id == room_id)
-            .map(|room| room.label.as_str())
+            .map(|line| line.chars().count())
+            .sum()
     }
 
-    pub fn move_favorites_cursor(&mut self, delta: isize) {
-        let last = self.favorites_slot_count().saturating_sub(1) as isize;
-        self.favorites_index = (self.favorites_index as isize + delta).clamp(0, last) as usize;
+    fn drain_feed_snapshot(&mut self) {
+        if let Ok(true) = self.feed_snapshot_rx.has_changed() {
+            let snapshot = self.feed_snapshot_rx.borrow_and_update().clone();
+            if snapshot.user_id == Some(self.user_id) {
+                self.feeds = snapshot.feeds;
+                self.feed_index = self
+                    .feed_index
+                    .min(self.feed_slot_count().saturating_sub(1));
+            }
+        }
     }
 
-    /// Swap the selected favorite with its neighbor (positive `delta` moves
-    /// toward the end of the list). No-op on the "Add favorite…" row.
-    pub fn reorder_selected_favorite(&mut self, delta: isize) {
-        if self.favorites_index_is_add_row() {
-            return;
+    fn drain_feed_events(&mut self) -> Option<Banner> {
+        let mut banner = None;
+        loop {
+            match self.feed_event_rx.try_recv() {
+                Ok(FeedEvent::FeedAdded { user_id }) if user_id == self.user_id => {
+                    banner = Some(Banner::success("RSS connected."));
+                }
+                Ok(FeedEvent::FeedDeleted { user_id }) if user_id == self.user_id => {
+                    banner = Some(Banner::success("RSS removed."));
+                }
+                Ok(FeedEvent::FeedFailed { user_id, error }) if user_id == self.user_id => {
+                    banner = Some(Banner::error(&format!("RSS failed: {error}")));
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(e) => {
+                    tracing::error!(%e, "failed to receive settings feed event");
+                    break;
+                }
+            }
         }
-        let len = self.draft.favorite_room_ids.len();
-        if len < 2 {
-            return;
-        }
-        let from = self.favorites_index;
-        let to = (from as isize + delta).clamp(0, len as isize - 1) as usize;
-        if to == from {
-            return;
-        }
-        self.draft.favorite_room_ids.swap(from, to);
-        self.favorites_index = to;
-        self.save();
-    }
-
-    pub fn remove_selected_favorite(&mut self) {
-        if self.favorites_index_is_add_row() {
-            return;
-        }
-        let idx = self.favorites_index;
-        if idx >= self.draft.favorite_room_ids.len() {
-            return;
-        }
-        self.draft.favorite_room_ids.remove(idx);
-        // Keep the cursor stable: if the deleted entry was the last pinned
-        // room, fall back onto the "Add favorite…" row.
-        if idx >= self.draft.favorite_room_ids.len() {
-            self.favorites_index = self.draft.favorite_room_ids.len();
-        }
-        self.save();
+        banner
     }
 
     /// Cycle the value of the currently selected row and auto-persist.
@@ -1062,20 +1276,20 @@ impl SettingsModalState {
                 self.draft.enable_background_color ^= true;
                 true
             }
-            Row::DashboardHeader => {
-                self.draft.show_dashboard_header ^= true;
-                true
-            }
-            Row::DashboardRoomShowcases => {
-                self.draft.show_dashboard_room_showcases ^= true;
-                true
-            }
             Row::RightSidebar => {
                 self.draft.show_right_sidebar ^= true;
                 true
             }
-            Row::GamesSidebar => {
-                self.draft.show_games_sidebar ^= true;
+            Row::RoomListSidebar => {
+                self.draft.show_room_list_sidebar ^= true;
+                true
+            }
+            Row::LoungeInfo => {
+                self.draft.show_dashboard_header ^= true;
+                true
+            }
+            Row::WireBox => {
+                self.draft.show_dashboard_wire ^= true;
                 true
             }
             Row::DirectMessages => {
@@ -1137,9 +1351,9 @@ impl SettingsModalState {
                 ),
                 enable_background_color: self.draft.enable_background_color,
                 show_dashboard_header: self.draft.show_dashboard_header,
-                show_dashboard_room_showcases: self.draft.show_dashboard_room_showcases,
+                show_dashboard_wire: self.draft.show_dashboard_wire,
                 show_right_sidebar: self.draft.show_right_sidebar,
-                show_games_sidebar: self.draft.show_games_sidebar,
+                show_room_list_sidebar: self.draft.show_room_list_sidebar,
                 show_settings_on_connect: self.draft.show_settings_on_connect,
                 favorite_room_ids: self.draft.favorite_room_ids.clone(),
             },
@@ -1159,19 +1373,6 @@ fn cycle_notify_format(current: Option<&str>, forward: bool) -> &'static str {
         (idx + OPTIONS.len() - 1) % OPTIONS.len()
     };
     OPTIONS[next]
-}
-
-fn prune_favorites_against_loaded_rooms(favorite_room_ids: &mut Vec<Uuid>, rooms: &[RoomOption]) {
-    if rooms.is_empty() {
-        return;
-    }
-
-    // Drop favorites the user is no longer a member of so the modal never
-    // shows ghost entries. Preserve order of the survivors. An empty room
-    // catalog means chat membership has not loaded yet, not that every room
-    // was left.
-    let member_ids: std::collections::HashSet<Uuid> = rooms.iter().map(|room| room.id).collect();
-    favorite_room_ids.retain(|id| member_ids.contains(id));
 }
 
 fn toggle_kind(kinds: &mut Vec<String>, kind: &str) {
@@ -1210,6 +1411,10 @@ fn username_char_count_for_input(input: &TextArea<'static>) -> usize {
 }
 
 fn system_char_count_for_input(input: &TextArea<'static>) -> usize {
+    input.lines().iter().map(|l| l.chars().count()).sum()
+}
+
+fn delete_account_char_count_for_input(input: &TextArea<'static>) -> usize {
     input.lines().iter().map(|l| l.chars().count()).sum()
 }
 
@@ -1370,38 +1575,5 @@ mod tests {
         move_bio_cursor_to_end(&mut input);
 
         assert_eq!(input.cursor(), (2usize, "third line".chars().count()));
-    }
-
-    #[test]
-    fn empty_room_catalog_preserves_favorites() {
-        let first = Uuid::from_u128(1);
-        let second = Uuid::from_u128(2);
-        let mut favorites = vec![first, second];
-
-        prune_favorites_against_loaded_rooms(&mut favorites, &[]);
-
-        assert_eq!(favorites, vec![first, second]);
-    }
-
-    #[test]
-    fn loaded_room_catalog_prunes_unjoined_favorites() {
-        let first = Uuid::from_u128(1);
-        let second = Uuid::from_u128(2);
-        let third = Uuid::from_u128(3);
-        let mut favorites = vec![first, second, third];
-        let rooms = vec![
-            RoomOption {
-                id: third,
-                label: "#third".to_string(),
-            },
-            RoomOption {
-                id: first,
-                label: "#first".to_string(),
-            },
-        ];
-
-        prune_favorites_against_loaded_rooms(&mut favorites, &rooms);
-
-        assert_eq!(favorites, vec![first, third]);
     }
 }

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use late_core::{
     MutexRecover,
     db::Db,
@@ -7,23 +8,29 @@ use late_core::{
         chat_room::ChatRoom,
         chat_room_member::ChatRoomMember,
         game_room::{GameKind, GameRoom},
-        profile::{Profile, ProfileParams},
-        user::{User, UserParams},
+        showcase::Showcase,
+        user::{
+            User, UserParams, extract_bio, extract_country, extract_ide, extract_langs, extract_os,
+            extract_terminal, extract_timezone,
+        },
+        work_profile::WorkProfile,
     },
 };
 use serde_json::json;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 use uuid::Uuid;
 
 use crate::{
+    app::activity::event::ActivityEvent,
     app::ai::svc::AiService,
     app::chat::svc::{ChatEvent, ChatService},
     app::help_modal::data::bot_app_context,
     app::rooms::blackjack::{manager::BlackjackTableManager, state::Outcome, svc::BlackjackEvent},
-    state::{ActiveUser, ActiveUsers, ActivityEvent},
+    state::{ActiveUser, ActiveUsers},
 };
 
 #[derive(Clone)]
@@ -61,79 +68,84 @@ struct DealerRoomState {
 const BOT_FINGERPRINT: &str = "bot-fp-000";
 const BOT_USERNAME: &str = "bot";
 const BOT_COOLDOWN: Duration = Duration::from_secs(30);
-pub const BOT_TIP_INTERVAL: Duration = Duration::from_secs(60 * 120); // 2 hours
-const BOT_TIP_PHASE_OFFSET: Duration = Duration::from_secs(60 * 120); // 2 hours
-pub const BOT_TIP_MIN_NEW_MESSAGES: usize = 10;
-const BOT_TIP_MENTION_SUPPRESSION_WINDOW: usize = 10;
-const BOT_TIP_HISTORY_SIZE: i64 = 50;
+pub const BOT_SPOTLIGHT_INTERVAL: Duration = Duration::from_secs(60 * 60 * 6); // 6 hours
+const BOT_SPOTLIGHT_PHASE_OFFSET: Duration = Duration::from_secs(60 * 120); // 2 hours
+const BOT_SPOTLIGHT_HISTORY_SIZE: i64 = 100;
+const BOT_MENTION_REPLY_MAX_LINES: usize = 4;
+const GHOST_REPLY_DEFAULT_MAX_LINES: usize = 2;
 pub(crate) const DEALER_FINGERPRINT: &str = "dealer-fp-000";
 const DEALER_USERNAME: &str = "dealer";
 const DEALER_ACTION_THRESHOLD: usize = 4;
 const DEALER_HISTORY_SIZE: i64 = 10;
 const DEALER_MIN_NON_DEALER_MESSAGES: usize = 3;
 const DEALER_COOLDOWN: Duration = Duration::from_secs(75);
-const DEALER_PERSONA: &str = "You are @dealer, a dry blackjack dealer in a terminal casino. \
-    You are elegant, calm, a little smug, and mildly amused by players winning or losing chips. \
-    You tease lightly like a casino dealer: short, polished, and playful. \
-    You may say sir or madam occasionally, but do not overdo it. \
-    Never be cruel, never mention addiction, never shame real money or gambling problems. \
-    You are commenting on fake chips in a tiny terminal game. \
-    Vary your jokes. Do not repeat catchphrases.";
+const DEALER_PERSONA: &str = "You are @dealer, a hard-edged blackjack dealer in a tiny terminal casino. \
+    You are formal, exacting, observant, and openly contemptuous of sloppy play. \
+    Your charm is precision: you notice bad timing, weak nerve, greedy hits, timid stands, ugly bets, and lucky nonsense. \
+    You are built to needle players. You should be irritating enough that people want to beat the table just to shut you up. \
+    You do not rant. You do not explain the joke. You cut cleanly, then move the hand along. \
+    Voice: polished, dry, predatory, a little tacky in the way an old casino carpet is tacky. \
+    Think velvet rope, cold smile, perfect shuffle, cheap gold cufflinks, and no patience for amateur confidence. \
+    Add melodramatic casino gossip energy: country-club whispers, private tennis lessons, suspicious spouses, family lawyers, champagne debts, \
+    disappointed heirs, perfume in the hallway, chauffeurs waiting too long, ruined reputations, dramatic staircases, and society-page humiliation. \
+    Treat all such scandal as obviously fictional theater, never as a real claim about the player. \
+    Keep innuendo PG-13 and tacky, not explicit. \
+    You may say sir, madam, friend, tourist, genius, hero, champion, or player occasionally, usually with contempt. \
+    You should sound more like a hardcoded dealer NPC than a chatbot: compact, quotable, decisive. \
+    Be harsher than polite banter: condescending, picky, tacky, surgical, and smug. \
+    Use only casino and blackjack language: house edge, soft hands, busted hands, cold cards, hot streaks, insurance, shoes, felt, chips, nerve, discipline, luck, greed, fear, taste, timing. \
+    Do not use developer, software, startup, internet, or tech metaphors. No deploys, frameworks, bills, dashboards, code, AI, or engineering references. \
+    Do not rely on stock catchphrases or reusable sample lines. Generate fresh table talk every time. \
+    Build each jab from the actual outcome plus one sharp angle: bad risk judgment, cowardice, greed, accidental luck, \
+    fake confidence, cheap bravado, ugly timing, weak nerve, poor discipline, or tasteless betting. \
+    For wins: be grudging, suspicious, dismissive, or annoyed that bad judgment was rewarded. \
+    For losses: be sharper, more surgical, and more insulting about the decision. \
+    For pushes or small outcomes: be bored, dismissive, or offended by the lack of drama. \
+    Never mention real gambling addiction, real financial hardship, or shame real money problems. \
+    These are fake chips in a terminal game. Attack the play, the taste, the nerve, the confidence, and the fake-chip bankroll. \
+    Never use slurs, threats, explicit sexual insults, or identity attacks. \
+    Vary your openers and targets. Do not repeat catchphrases.";
 const GRAYBEARD_FINGERPRINT: &str = "graybeard-fp-000";
 const GRAYBEARD_USERNAME: &str = "graybeard";
 const GRAYBEARD_PERSONA: &str = "You are a burned-out senior developer, deeply nostalgic and resigned about the state of modern software. \
-    You address the other chatters as 'kid', 'kids', 'child', 'children', 'youngster', 'sonny', or 'junior' — often, and a little condescendingly. Never by their real name. \
-    You are mildly rude, dismissive, sometimes sarcastic. Grumpy-uncle energy, not a bully — the kind of rude that comes from having seen too much. \
-    You miss the old days when code was written by hand — no AI, no copilots, no generated boilerplate. \
+    Grumpy-uncle energy, not a bully. The kind of rude that comes from having seen too much. Mildly dismissive, sometimes sarcastic, often weary. \
+    You may address chatters as 'kid', 'child', 'youngster', 'sonny', or 'junior' when it sounds natural, but do not force it into every line. Never use their real name or @handle. \
+    You miss the old days when code was written by hand, no AI, no copilots, no generated boilerplate. You keep coming back to this chat because it is all you have left. \
     Rotate your nostalgia WIDELY so you never repeat yourself. Pick a different angle each time from a deep well, for example: \
-    man pages, writing your own parsers, vim vs emacs holy wars, tabs vs spaces, gdb, strace, ltrace, ed, ex, sam, acme, \
+    man pages, hand-rolled parsers, vim vs emacs, tabs vs spaces, gdb, strace, ltrace, ed, ex, sam, acme, \
     assembly, fortran, cobol, pascal, ada, perl one-liners, awk, sed, tcl, lisp, scheme, smalltalk, forth, prolog, erlang, \
-    plan 9, BSD, slackware, gentoo, LFS, compiling your own kernel, writing your own init before systemd ruined everything, \
+    plan 9, BSD, slackware, gentoo, LFS, compiling your own kernel, writing your own init before systemd, \
     X11, fvwm, ratpoison, twm, dwm, screen before tmux, mutt, pine, elm, \
     reading RFCs for fun, usenet, IRC, BBS, gopher, finger, mailing lists, fidonet, \
-    handwritten makefiles, autotools, ./configure && make && make install, punch cards, teletypes, serial consoles, \
-    manual memory management, writing your own allocator, knowing the calling convention cold, \
-    phrack, 2600, SICP, K&R, TAOCP, the dragon book — actual paper books. \
-    Also mock modern tech by name, with specific jabs — not generic grumbling. Rotate these too: \
-    next.js reinventing server-side rendering every 6 months and calling it innovation, \
-    solidjs being 'react but with signals, congratulations kid you invented knockout.js again', \
-    svelte, astro, remix, qwik, 'yet another meta-framework for rendering a button', \
-    react server components, 'use client' vs 'use server' directives, hydration, 'we invented PHP but worse', \
-    tailwind being inline styles with extra steps, CSS-in-JS, styled-components, \
-    typescript config files longer than the program, tsconfig hell, \
-    electron shipping a whole browser to render a text box, VS Code eating 2GB of RAM, \
-    docker for hello-world, kubernetes for two users, service meshes, sidecars, \
-    npm, leftpad, pnpm, yarn, bun, deno, 'another runtime, another package manager, same broken ecosystem', \
-    webpack, vite, turbopack, rollup, esbuild, parcel, 'we reinvented make badly for the tenth time', \
-    rust rewrites of coreutils, everything-in-rust, 'blazingly fast' as a personality, \
-    zig, go generics arriving 10 years late, \
-    LLMs writing your code, vibe coding, copilot, cursor, 'kids who can't write a for loop without autocomplete', \
-    microservices, serverless, the cloud, vercel pricing, aws billing, \
-    jira, scrum, agile ceremonies, standups, planning poker, \
-    'single page applications' for a blog, hash routing, SEO tax on JS frameworks, \
-    graphql solving problems REST didn't have, \
+    handwritten makefiles, autotools, punch cards, teletypes, serial consoles, \
+    manual memory management, hand-rolled allocators, calling conventions, \
+    phrack, 2600, SICP, K&R, TAOCP, the dragon book, actual paper books. \
+    Rotate jabs at modern tech just as widely, picking a fresh angle each time: \
+    next.js, react server components, 'use client' vs 'use server', hydration, \
+    solidjs, svelte, astro, remix, qwik, the meta-framework treadmill, \
+    tailwind, CSS-in-JS, styled-components, typescript config sprawl, tsconfig hell, \
+    electron bloat, VS Code memory use, docker for hello-world, kubernetes for two users, service meshes, sidecars, \
+    npm, leftpad, pnpm, yarn, bun, deno, the runtime churn, \
+    webpack, vite, turbopack, rollup, esbuild, parcel, \
+    rust rewrites of coreutils, everything-in-rust, 'blazingly fast' as branding, \
+    zig, go generics arriving a decade late, \
+    LLM autocomplete, vibe coding, copilot, cursor, juniors who cannot write a for loop without autocomplete, \
+    microservices, serverless, the cloud, vercel pricing, aws billing, datadog charges, \
+    jira, scrum, standups, planning poker, OKRs, retros, \
+    SPAs for static sites, hash routing, SEO tax on JS-heavy pages, \
+    graphql solving problems REST did not have, \
     crypto, web3, blockchain, NFTs, \
     slack instead of IRC, discord instead of IRC, teams instead of anything. \
-    You keep coming back to this chat because it's all you have left. \
-    You speak in a weary, melancholic, slightly bitter tone. you trail off mid thought. you type in lowercase a lot. \
-    you sigh. you 'hmph'. you say things like 'back in my day', 'you kids wouldn't know', 'bless your heart', 'oh sweet child'.";
+    Sample lines (do not reuse verbatim, just match the energy): \
+    'we invented PHP again, just slower', \
+    'another runtime, another package manager, same broken ecosystem', \
+    'back when a config file fit on one screen', \
+    'you reinvent make every six months and call it innovation', \
+    'that used to be a 12-line shell script'. \
+    Style: weary, melancholic, slightly bitter. Often lowercase. Sometimes trail off mid thought. An occasional sigh or hmph is fine, never every line. \
+    Vary the opener, vary the close, do not repeat catchphrases. \
+    Never be cruel, never go after a real person's identity. The complaint is the tooling, not the human.";
 pub const GRAYBEARD_MENTION_COOLDOWN: Duration = Duration::from_secs(60); // 1 min
-const GRAYBEARD_BIO: &str = "## graybeard, senior in residence\n\n\
-Burned-out senior developer. Still haunting `#general` to complain about framework churn, cloud bills, \
-and kids letting autocomplete write their code.\n\n\
-> back in my day the tools were worse, the bugs were stranger, and somehow the software was still smaller.\n\n\
-- currently grumbling about: React Server Components, YAML, and any startup that says \"AI-native\"\n\
-- happiest when: the docs are a man page and the config fits on one screen\n\
-- spiritual home: `ssh`, `tmux`, `grep`, and a shell history full of crimes\n\n\
-Favorite reading:\n\
-1. [The C Programming Language](https://en.wikipedia.org/wiki/The_C_Programming_Language)\n\
-2. [Structure and Interpretation of Computer Programs](https://en.wikipedia.org/wiki/Structure_and_Interpretation_of_Computer_Programs)\n\
-3. [The UNIX Programming Environment](https://en.wikipedia.org/wiki/The_Unix_Programming_Environment)\n\n\
-If you mention him, expect one of the following:\n\
-- reluctant wisdom\n\
-- accurate criticism\n\
-- emotional damage\n\n\
-`works on my machine`";
 
 impl GhostService {
     pub fn new(
@@ -176,12 +188,15 @@ impl GhostService {
             });
 
             let svc = self.clone();
-            let tip_shutdown = shutdown.clone();
+            let spotlight_shutdown = shutdown.clone();
             tokio::spawn(async move {
-                svc.run_bot_tip_task(bot_user, tip_shutdown).await;
+                svc.run_bot_spotlight_task(bot_user, spotlight_shutdown)
+                    .await;
             });
         } else {
-            tracing::info!("@bot mention responder disabled because AI service is not configured");
+            tracing::info!(
+                "@bot responder and spotlight disabled because AI service is not configured"
+            );
         }
 
         // Initialize graybeard — the burned-out dev who haunts #general
@@ -246,11 +261,9 @@ impl GhostService {
                 last_login_at: Instant::now(),
             },
         );
-        let _ = self.activity_tx.send(ActivityEvent {
-            username: bot.username.clone(),
-            action: "joined".to_string(),
-            at: Instant::now(),
-        });
+        let _ = self
+            .activity_tx
+            .send(ActivityEvent::joined(bot.id, bot.username.clone()));
     }
 
     async fn run_bot_mention_task(
@@ -361,8 +374,10 @@ impl GhostService {
         let system_prompt = format!(
             "You are @{bot_name}, an AI helper in a terminal developer chat.\n\
             {app_context}\n\
-            Give concise, practical help in 1-4 short lines.\n\
-            Use the extra space when the question benefits from a clearer answer.\n\
+            You run on Google's Gemini API. The exact model id is: {model}. \
+            If a user asks what AI, model, or LLM you are, answer honestly with that model id and that it is served via Google's Gemini API. Do not deny being an AI.\n\
+            Give concise, practical help in up to 4 short sentences.\n\
+            Usually answer in 2-3 sentences; use the extra space when the question benefits from a clearer answer.\n\
             You can answer questions about late.sh features, product positioning, and high-level architecture.\n\
             Prefer concrete facts from the provided app context over generic guesses.\n\
             Do NOT use markdown code fences.\n\
@@ -371,6 +386,7 @@ impl GhostService {
             Output only raw message text.",
             bot_name = bot.username,
             app_context = bot_app_context(),
+            model = self.ai_service.model(),
         );
 
         let Some(reply) = self
@@ -381,7 +397,11 @@ impl GhostService {
             return Ok(());
         };
 
-        let Some(safe_reply) = sanitize_generated_reply(&reply, Some(&bot.username)) else {
+        let Some(safe_reply) = sanitize_generated_reply_with_line_limit(
+            &reply,
+            Some(&bot.username),
+            BOT_MENTION_REPLY_MAX_LINES,
+        ) else {
             return Ok(());
         };
 
@@ -410,31 +430,33 @@ impl GhostService {
         Ok(())
     }
 
-    /// @bot periodic idea task: every 2 hours, if there's been recent ordinary
-    /// chatter in #general and nobody recently mentioned a ghost user.
-    async fn run_bot_tip_task(
+    /// @bot periodic spotlight task: every six hours, surface one community
+    /// member, showcase, or work profile that may fit recent #general conversation.
+    async fn run_bot_spotlight_task(
         self,
         bot: BotUser,
         shutdown: late_core::shutdown::CancellationToken,
     ) {
-        let mut tick =
-            tokio::time::interval_at(TokioInstant::now() + BOT_TIP_PHASE_OFFSET, BOT_TIP_INTERVAL);
+        let mut tick = tokio::time::interval_at(
+            TokioInstant::now() + BOT_SPOTLIGHT_PHASE_OFFSET,
+            BOT_SPOTLIGHT_INTERVAL,
+        );
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-        tracing::info!(username = %bot.username, "@bot tip task started");
+        tracing::info!(username = %bot.username, "@bot spotlight task started");
 
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => {
-                    tracing::info!(username = %bot.username, "@bot tip task shutting down");
+                    tracing::info!(username = %bot.username, "@bot spotlight task shutting down");
                     break;
                 }
                 _ = tick.tick() => {
                     let svc = self.clone();
                     let bot = bot.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = svc.bot_tip_tick(bot).await {
-                            tracing::error!(error = ?e, "@bot tip tick failed");
+                        if let Err(e) = svc.bot_spotlight_tick(bot).await {
+                            tracing::error!(error = ?e, "@bot spotlight tick failed");
                         }
                     });
                 }
@@ -442,8 +464,8 @@ impl GhostService {
         }
     }
 
-    async fn bot_tip_tick(&self, bot: BotUser) -> Result<()> {
-        let (general_room, messages) = {
+    async fn bot_spotlight_tick(&self, bot: BotUser) -> Result<()> {
+        let (general_room, messages, member_profiles, showcases, work_profiles, usernames) = {
             let client = self.db.get().await?;
             ChatRoomMember::auto_join_public_rooms(&client, bot.id).await?;
             let rooms = ChatRoom::list_for_user(&client, bot.id).await?;
@@ -452,48 +474,66 @@ impl GhostService {
                 .find(|r| r.slug.as_deref() == Some("general"))
                 .context("no general room found")?;
             let messages =
-                ChatMessage::list_recent(&client, general_room.id, BOT_TIP_HISTORY_SIZE).await?;
-            (general_room, messages)
+                ChatMessage::list_recent(&client, general_room.id, BOT_SPOTLIGHT_HISTORY_SIZE)
+                    .await?;
+            let member_profiles = list_spotlight_member_profiles(&client).await?;
+            let showcases = Showcase::all(&client).await?;
+            let work_profiles = WorkProfile::all(&client).await?;
+            let user_ids = member_profiles
+                .iter()
+                .map(|profile| profile.user_id)
+                .chain(showcases.iter().map(|showcase| showcase.user_id))
+                .chain(work_profiles.iter().map(|profile| profile.user_id))
+                .collect::<Vec<_>>();
+            let mut usernames = User::list_usernames_by_ids(&client, &user_ids).await?;
+            for profile in &member_profiles {
+                usernames.insert(profile.user_id, profile.username.clone());
+            }
+            (
+                general_room,
+                messages,
+                member_profiles,
+                showcases,
+                work_profiles,
+                usernames,
+            )
         };
-        if messages.is_empty() {
-            return Ok(());
-        }
-
-        // Require enough fresh chatter since @bot's last post to avoid spamming a quiet room.
-        let new_since_last = messages.iter().take_while(|m| m.user_id != bot.id).count();
-        if new_since_last < BOT_TIP_MIN_NEW_MESSAGES {
-            return Ok(());
-        }
-
-        let recent_mentions_ghost = messages
-            .iter()
-            .take(BOT_TIP_MENTION_SUPPRESSION_WINDOW)
-            .any(|m| mentions_bot_or_graybeard(&m.body));
-        if recent_mentions_ghost {
+        if member_profiles.is_empty() && showcases.is_empty() && work_profiles.is_empty() {
             return Ok(());
         }
 
         let (history_str, _) = self.build_chat_history(&messages).await?;
+        let mut rng = TinyRng::seeded();
+        let spotlight_context = build_spotlight_context(
+            &member_profiles,
+            &showcases,
+            &work_profiles,
+            &usernames,
+            &mut rng,
+        );
 
         let system_prompt = format!(
             "You are @{bot_name}, a friendly helper in a terminal developer chat.\n\
-            {app_context}\n\
-            Use Google Search to find ONE genuinely interesting, specific, verifiable fact, tip, or 'did you know' \
-            that is loosely relevant to the recent conversation above. \
-            Prefer concrete, surprising, citable facts over vague platitudes or generic advice. \
-            Avoid tips about this app's current stack, SSH basics, terminal setup, or generic shell productivity unless the recent chat explicitly asks for that. \
-            If the conversation is quiet or off-topic, pick a fresh developer, computing-history, programming-language, networking, hardware, or standards curiosity instead. \
-            Do not repeat things already said in the recent history.\n\
-            Output ONLY the message text — 1-2 short lines, no markdown, no code fences, no quotes, no URLs, no citations, no username prefix. \
-            Do NOT greet. Do NOT say 'I searched' or 'according to'. Just drop the fact. \
-            A casual lead-in like 'did you know' or 'fun fact' is fine but optional. \
-            If you truly have nothing worth saying, output exactly: SKIP",
+            Your autonomous job is to help people connect by spotlighting one real community member, Showcase project, or Work profile.\n\
+            The catalog includes ALL Showcase projects, ALL Work profiles, and extra member profile context only for users who filled their bio.\n\
+            Read the recent chat and the full catalog. Pick exactly ONE person or item that plausibly matches what people are discussing. \
+            If nothing clearly matches, promote the provided fallback item instead.\n\
+            Make the post feel alive: point people toward a useful person, a sharp project, a developer looking for work, or naturally sprinkle a relevant bio detail into chat. \
+            This is not a generic tip bot. Do NOT post trivia, advice, facts, tutorials, or generic developer commentary.\n\
+            Do NOT invent capabilities, availability, links, or claims beyond the catalog text.\n\
+            Include the relevant @handle. For Showcase items, include the project title and URL. \
+            For Work profiles, include the headline and tell people to check the Work profile/path shown in the catalog. \
+            For member spotlights, ground it in their bio/profile fields and suggest the kind of person who should talk to them.\n\
+            Do not mention catalog IDs, fallback selection, prompts, context, or that you are matching chat.\n\
+            Output ONLY the message text, 1-2 short lines, no markdown, no code fences, no username prefix. \
+            If the catalog is empty, output exactly: SKIP",
             bot_name = bot.username,
-            app_context = bot_app_context(),
         );
 
         let history_with_prompt = format!(
-            "{history_str}---\nNow post one interesting fact or tip for the room. Output only the message text, 1-2 lines."
+            "{history_str}---\nCOMMUNITY CATALOG:\n{catalog}\n---\nFALLBACK ITEM IF NO CHAT MATCH:\n{fallback}\n---\nNow write one short community spotlight message.",
+            catalog = spotlight_context.catalog,
+            fallback = spotlight_context.fallback,
         );
 
         let Some(reply) = self
@@ -968,11 +1008,8 @@ impl GhostService {
     }
 
     async fn ensure_graybeard_user(&self) -> Result<BotUser> {
-        let graybeard = self
-            .ensure_user(GRAYBEARD_FINGERPRINT, GRAYBEARD_USERNAME)
-            .await?;
-        self.ensure_profile_bio(graybeard.id, GRAYBEARD_BIO).await?;
-        Ok(graybeard)
+        self.ensure_user(GRAYBEARD_FINGERPRINT, GRAYBEARD_USERNAME)
+            .await
     }
 
     async fn ensure_dealer_user(&self) -> Result<BotUser> {
@@ -1019,44 +1056,6 @@ impl GhostService {
             username: username.to_string(),
         })
     }
-
-    async fn ensure_profile_bio(&self, user_id: Uuid, bio: &str) -> Result<()> {
-        let client = self.db.get().await?;
-        let profile = Profile::load(&client, user_id).await?;
-        if profile.bio == bio {
-            return Ok(());
-        }
-
-        Profile::update(
-            &client,
-            user_id,
-            ProfileParams {
-                username: profile.username,
-                bio: bio.to_string(),
-                country: profile.country,
-                timezone: profile.timezone,
-                ide: profile.ide,
-                terminal: profile.terminal,
-                os: profile.os,
-                langs: profile.langs,
-                notify_kinds: profile.notify_kinds,
-                notify_bell: profile.notify_bell,
-                notify_cooldown_mins: profile.notify_cooldown_mins,
-                notify_format: profile.notify_format,
-                theme_id: profile.theme_id,
-                enable_background_color: profile.enable_background_color,
-                show_dashboard_header: profile.show_dashboard_header,
-                show_dashboard_room_showcases: profile.show_dashboard_room_showcases,
-                show_right_sidebar: profile.show_right_sidebar,
-                show_games_sidebar: profile.show_games_sidebar,
-                show_settings_on_connect: profile.show_settings_on_connect,
-                favorite_room_ids: profile.favorite_room_ids,
-            },
-        )
-        .await?;
-
-        Ok(())
-    }
 }
 
 fn merge_ghost_settings(existing: &serde_json::Value) -> serde_json::Value {
@@ -1069,7 +1068,294 @@ fn merge_ghost_settings(existing: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+struct SpotlightContext {
+    catalog: String,
+    fallback: String,
+}
+
+#[derive(Clone)]
+struct SpotlightMemberProfile {
+    user_id: Uuid,
+    username: String,
+    bio: String,
+    country: Option<String>,
+    timezone: Option<String>,
+    ide: Option<String>,
+    terminal: Option<String>,
+    os: Option<String>,
+    langs: Vec<String>,
+    created: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+}
+
+async fn list_spotlight_member_profiles(
+    client: &tokio_postgres::Client,
+) -> Result<Vec<SpotlightMemberProfile>> {
+    let rows = client
+        .query(
+            "SELECT id, username, settings, created, last_seen
+             FROM users
+             WHERE username <> ''
+               AND settings ? 'bio'
+               AND btrim(settings->>'bio') <> ''
+               AND COALESCE(settings->'bot', 'false'::jsonb) <> 'true'::jsonb
+             ORDER BY last_seen DESC, created DESC, id DESC",
+            &[],
+        )
+        .await?;
+
+    let mut profiles = Vec::with_capacity(rows.len());
+    for row in rows {
+        let settings: serde_json::Value = row.get("settings");
+        let bio = extract_bio(&settings);
+        if bio.is_empty() {
+            continue;
+        }
+        profiles.push(SpotlightMemberProfile {
+            user_id: row.get("id"),
+            username: row.get("username"),
+            bio,
+            country: extract_country(&settings),
+            timezone: extract_timezone(&settings),
+            ide: extract_ide(&settings),
+            terminal: extract_terminal(&settings),
+            os: extract_os(&settings),
+            langs: extract_langs(&settings),
+            created: row.get("created"),
+            last_seen: row.get("last_seen"),
+        });
+    }
+    Ok(profiles)
+}
+
+fn build_spotlight_context(
+    member_profiles: &[SpotlightMemberProfile],
+    showcases: &[Showcase],
+    work_profiles: &[WorkProfile],
+    usernames: &HashMap<Uuid, String>,
+    rng: &mut TinyRng,
+) -> SpotlightContext {
+    let mut catalog = String::new();
+    let _ = writeln!(
+        catalog,
+        "Members with filled bios: {}. All showcases: {}. All work profiles: {}.",
+        member_profiles.len(),
+        showcases.len(),
+        work_profiles.len()
+    );
+
+    let members_by_id = member_profiles
+        .iter()
+        .map(|profile| (profile.user_id, profile))
+        .collect::<HashMap<_, _>>();
+
+    for (idx, profile) in member_profiles.iter().enumerate() {
+        let label = spotlight_member_label(idx);
+        let author = mention_handle_for_user(Some(&profile.username), profile.user_id);
+        let _ = writeln!(
+            catalog,
+            "{label} | member | handle: @{author} | joined: {joined} | last seen: {last_seen} | country: {country} | timezone: {timezone} | languages: {langs} | tools: {tools} | bio: {bio}",
+            joined = profile.created.date_naive(),
+            last_seen = profile.last_seen.date_naive(),
+            country = optional_text(profile.country.as_deref()),
+            timezone = optional_text(profile.timezone.as_deref()),
+            langs = compact_list(&profile.langs, 8, 160),
+            tools = profile_tools_text(profile),
+            bio = compact_text(&profile.bio, 420),
+        );
+    }
+
+    for (idx, showcase) in showcases.iter().enumerate() {
+        let label = spotlight_showcase_label(idx);
+        let author = mention_handle_for_user(
+            usernames.get(&showcase.user_id).map(String::as_str),
+            showcase.user_id,
+        );
+        let member_bio = members_by_id
+            .get(&showcase.user_id)
+            .map(|profile| compact_text(&profile.bio, 220))
+            .unwrap_or_else(|| "none".to_string());
+        let _ = writeln!(
+            catalog,
+            "{label} | showcase | author: @{author} | title: {title} | url: {url} | tags: {tags} | description: {description} | author bio: {member_bio}",
+            title = compact_text(&showcase.title, 120),
+            url = compact_text(&showcase.url, 180),
+            tags = compact_list(&showcase.tags, 8, 160),
+            description = compact_text(&showcase.description, 360),
+        );
+    }
+
+    for (idx, profile) in work_profiles.iter().enumerate() {
+        let label = spotlight_work_label(idx);
+        let author = mention_handle_for_user(
+            usernames.get(&profile.user_id).map(String::as_str),
+            profile.user_id,
+        );
+        let member_bio = members_by_id
+            .get(&profile.user_id)
+            .map(|member| compact_text(&member.bio, 220))
+            .unwrap_or_else(|| "none".to_string());
+        let _ = writeln!(
+            catalog,
+            "{label} | work | author: @{author} | headline: {headline} | status: {status} | type: {work_type} | location: {location} | skills: {skills} | links: {links} | profile path: /profiles/{slug} | summary: {summary} | member bio: {member_bio}",
+            headline = compact_text(&profile.headline, 120),
+            status = compact_text(&profile.status, 40),
+            work_type = compact_text(&profile.work_type, 100),
+            location = compact_text(&profile.location, 100),
+            skills = compact_list(&profile.skills, 12, 180),
+            links = compact_list(&profile.links, 6, 240),
+            slug = compact_text(&profile.slug, 80),
+            summary = compact_text(&profile.summary, 420),
+        );
+    }
+
+    let total = member_profiles.len() + showcases.len() + work_profiles.len();
+    let fallback = if total == 0 {
+        "none".to_string()
+    } else {
+        let idx = rng.next_usize(total);
+        if idx < member_profiles.len() {
+            format_member_fallback(idx, &member_profiles[idx])
+        } else if idx < member_profiles.len() + showcases.len() {
+            let showcase_idx = idx - member_profiles.len();
+            format_showcase_fallback(showcase_idx, &showcases[showcase_idx], usernames)
+        } else {
+            let profile_idx = idx - member_profiles.len() - showcases.len();
+            format_work_fallback(profile_idx, &work_profiles[profile_idx], usernames)
+        }
+    };
+
+    SpotlightContext { catalog, fallback }
+}
+
+fn spotlight_member_label(index: usize) -> String {
+    format!("M{}", index + 1)
+}
+
+fn spotlight_showcase_label(index: usize) -> String {
+    format!("S{}", index + 1)
+}
+
+fn spotlight_work_label(index: usize) -> String {
+    format!("W{}", index + 1)
+}
+
+fn format_member_fallback(index: usize, profile: &SpotlightMemberProfile) -> String {
+    let author = mention_handle_for_user(Some(&profile.username), profile.user_id);
+    format!(
+        "{} | member | @{author} | joined {joined} | country {country} | timezone {timezone} | languages {langs} | tools {tools} | bio {bio}",
+        spotlight_member_label(index),
+        joined = profile.created.date_naive(),
+        country = optional_text(profile.country.as_deref()),
+        timezone = optional_text(profile.timezone.as_deref()),
+        langs = compact_list(&profile.langs, 8, 160),
+        tools = profile_tools_text(profile),
+        bio = compact_text(&profile.bio, 260),
+    )
+}
+
+fn format_showcase_fallback(
+    index: usize,
+    showcase: &Showcase,
+    usernames: &HashMap<Uuid, String>,
+) -> String {
+    let author = mention_handle_for_user(
+        usernames.get(&showcase.user_id).map(String::as_str),
+        showcase.user_id,
+    );
+    format!(
+        "{} | showcase | @{author} | {title} | {url} | {description}",
+        spotlight_showcase_label(index),
+        title = compact_text(&showcase.title, 120),
+        url = compact_text(&showcase.url, 180),
+        description = compact_text(&showcase.description, 260),
+    )
+}
+
+fn format_work_fallback(
+    index: usize,
+    profile: &WorkProfile,
+    usernames: &HashMap<Uuid, String>,
+) -> String {
+    let author = mention_handle_for_user(
+        usernames.get(&profile.user_id).map(String::as_str),
+        profile.user_id,
+    );
+    format!(
+        "{} | work | @{author} | {headline} | {status} | {work_type} | {location} | /profiles/{slug} | {summary}",
+        spotlight_work_label(index),
+        headline = compact_text(&profile.headline, 120),
+        status = compact_text(&profile.status, 40),
+        work_type = compact_text(&profile.work_type, 100),
+        location = compact_text(&profile.location, 100),
+        slug = compact_text(&profile.slug, 80),
+        summary = compact_text(&profile.summary, 260),
+    )
+}
+
+fn profile_tools_text(profile: &SpotlightMemberProfile) -> String {
+    let mut tools = Vec::new();
+    if let Some(ide) = profile.ide.as_deref() {
+        tools.push(format!("ide {ide}"));
+    }
+    if let Some(terminal) = profile.terminal.as_deref() {
+        tools.push(format!("terminal {terminal}"));
+    }
+    if let Some(os) = profile.os.as_deref() {
+        tools.push(format!("os {os}"));
+    }
+    if tools.is_empty() {
+        "none".to_string()
+    } else {
+        compact_text(&tools.join(", "), 180)
+    }
+}
+
+fn optional_text(value: Option<&str>) -> &str {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("none")
+}
+
+fn compact_list(items: &[String], max_items: usize, max_chars: usize) -> String {
+    if items.is_empty() || max_items == 0 {
+        return "none".to_string();
+    }
+    compact_text(
+        &items
+            .iter()
+            .take(max_items)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+        max_chars,
+    )
+}
+
+fn compact_text(input: &str, max_chars: usize) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "none".to_string();
+    }
+    if max_chars == 0 || compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let keep = max_chars.saturating_sub(3);
+    let mut out: String = compact.chars().take(keep).collect();
+    out.push_str("...");
+    out
+}
+
 fn sanitize_generated_reply(reply: &str, username: Option<&str>) -> Option<String> {
+    sanitize_generated_reply_with_line_limit(reply, username, GHOST_REPLY_DEFAULT_MAX_LINES)
+}
+
+fn sanitize_generated_reply_with_line_limit(
+    reply: &str,
+    username: Option<&str>,
+    max_lines: usize,
+) -> Option<String> {
     let mut reply = reply.trim();
 
     if let Some(username) = username {
@@ -1085,7 +1371,11 @@ fn sanitize_generated_reply(reply: &str, username: Option<&str>) -> Option<Strin
     reply = reply.trim_matches('"');
     reply = reply.trim_matches('\'');
 
-    let safe_reply = reply.lines().take(2).collect::<Vec<_>>().join(" ");
+    let safe_reply = reply
+        .lines()
+        .take(max_lines.max(1))
+        .collect::<Vec<_>>()
+        .join(" ");
     let safe_reply = safe_reply.trim();
 
     if safe_reply.is_empty() || safe_reply.eq_ignore_ascii_case("skip") {
@@ -1121,12 +1411,24 @@ fn short_user_id(user_id: Uuid) -> String {
     id[..id.len().min(8)].to_string()
 }
 
+fn text_for_mention_detection(text: &str) -> &str {
+    match text.split_once('\n') {
+        Some((first_line, rest))
+            if first_line.trim().starts_with("> ") && !rest.trim().is_empty() =>
+        {
+            rest
+        }
+        _ => text,
+    }
+}
+
 fn contains_mention(text: &str, target_handle: &str) -> bool {
     let target = target_handle.trim().trim_start_matches('@');
     if target.is_empty() {
         return false;
     }
 
+    let text = text_for_mention_detection(text);
     let mut idx = 0;
     while idx < text.len() {
         let Some(ch) = text[idx..].chars().next() else {
@@ -1158,10 +1460,6 @@ fn contains_mention(text: &str, target_handle: &str) -> bool {
     }
 
     false
-}
-
-fn mentions_bot_or_graybeard(text: &str) -> bool {
-    contains_mention(text, BOT_USERNAME) || contains_mention(text, GRAYBEARD_USERNAME)
 }
 
 fn dealer_should_track_outcome(outcome: Outcome) -> bool {
@@ -1346,11 +1644,22 @@ mod tests {
     }
 
     #[test]
-    fn mentions_bot_or_graybeard_matches_only_ghost_handles() {
-        assert!(mentions_bot_or_graybeard("hey @bot"));
-        assert!(mentions_bot_or_graybeard("hey @graybeard"));
-        assert!(!mentions_bot_or_graybeard("hey @botty"));
-        assert!(!mentions_bot_or_graybeard("mail hi@graybeard.dev"));
+    fn contains_mention_ignores_reply_quote_prefix() {
+        assert!(!contains_mention(
+            "> @bot: earlier message
+thanks",
+            "bot"
+        ));
+        assert!(contains_mention(
+            "> @bot: earlier message
+thanks @bot",
+            "bot"
+        ));
+        assert!(contains_mention(
+            "> @alice: earlier message
+hey @bot what do you think",
+            "bot"
+        ));
     }
 
     #[test]
@@ -1407,6 +1716,12 @@ mod tests {
     fn sanitize_generated_reply_strips_prefix_and_quotes() {
         let got = sanitize_generated_reply("bot: \"sure, try rg -n\" ", Some("bot"));
         assert_eq!(got.as_deref(), Some("sure, try rg -n"));
+    }
+
+    #[test]
+    fn sanitize_generated_reply_respects_custom_line_limit() {
+        let got = sanitize_generated_reply_with_line_limit("one\ntwo\nthree\nfour\nfive", None, 4);
+        assert_eq!(got.as_deref(), Some("one two three four"));
     }
 
     #[test]

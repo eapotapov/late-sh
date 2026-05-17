@@ -19,24 +19,25 @@ use late_core::models::leaderboard::LeaderboardData;
 use late_core::models::profile::Profile;
 
 use crate::{
+    app::activity::{
+        channel::ACTIVITY_HISTORY_MAX_EVENTS, event::ActivityEvent, filter::ActivityFilter,
+    },
+    app::audio::{client_state::ClientAudioState, viz::Visualizer},
     app::{
         chat,
         chat::news::svc::ArticleService,
         chat::notifications::svc::NotificationService,
         chat::svc::ChatService,
         common::primitives::{Banner, Screen},
-        help_modal, mod_modal, profile,
+        help_modal, hub, mod_modal, profile,
         profile::svc::ProfileService,
-        profile_modal, settings_modal,
-        visualizer::Visualizer,
-        vote,
+        profile_modal, settings_modal, vote,
         vote::svc::{Genre, VoteService},
     },
     authz::Permissions,
-    session::{
-        ClientAudioState, PairControlMessage, PairedClientRegistry, SessionMessage, SessionRegistry,
-    },
-    state::{ActiveUsers, ActivityEvent},
+    paired_clients::{PairControlMessage, PairedClientRegistry},
+    session::{SessionMessage, SessionRegistry},
+    state::ActiveUsers,
     web::WebChatRegistry,
 };
 
@@ -55,6 +56,7 @@ pub(crate) const GAME_SELECTION_SUDOKU: usize = 2;
 pub(crate) const GAME_SELECTION_NONOGRAMS: usize = 3;
 pub(crate) const GAME_SELECTION_MINESWEEPER: usize = 4;
 pub(crate) const GAME_SELECTION_SOLITAIRE: usize = 5;
+pub(crate) const GAME_SELECTION_SNAKE: usize = 6;
 pub(crate) const DEFAULT_GAME_SELECTION: usize = GAME_SELECTION_2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +76,32 @@ impl NotificationMode {
             _ => Self::Both,
         }
     }
+}
+
+fn seed_activity_from_history(
+    mut activity: VecDeque<ActivityEvent>,
+    activity_feed_rx: Option<&mut broadcast::Receiver<ActivityEvent>>,
+) -> VecDeque<ActivityEvent> {
+    let Some(rx) = activity_feed_rx else {
+        return activity;
+    };
+    let newest_seed_at = activity.back().map(|event| event.at);
+    let activity_filter = ActivityFilter::dashboard();
+
+    while let Ok(event) = rx.try_recv() {
+        if newest_seed_at.is_some_and(|at| event.at <= at) {
+            continue;
+        }
+        if !activity_filter.includes(&event) {
+            continue;
+        }
+        activity.push_back(event);
+        while activity.len() > ACTIVITY_HISTORY_MAX_EVENTS {
+            activity.pop_front();
+        }
+    }
+
+    activity
 }
 
 const CURSOR_SHAPE_STEADY_BLOCK: &[u8] = b"\x1b[2 q";
@@ -109,29 +137,35 @@ pub struct SessionConfig {
     pub rows: u16,
 
     /// Services / data sources
+    pub audio_service: crate::app::audio::svc::AudioService,
     pub vote_service: VoteService,
     pub chat_service: ChatService,
     pub notification_service: NotificationService,
     pub article_service: ArticleService,
+    pub feed_service: crate::app::chat::feeds::svc::FeedService,
     pub showcase_service: crate::app::chat::showcase::svc::ShowcaseService,
+    pub work_service: crate::app::chat::work::svc::WorkService,
     pub profile_service: ProfileService,
     pub twenty_forty_eight_service:
-        crate::app::games::twenty_forty_eight::svc::TwentyFortyEightService,
+        crate::app::arcade::twenty_forty_eight::svc::TwentyFortyEightService,
     pub initial_2048_game: Option<late_core::models::twenty_forty_eight::Game>,
     pub initial_2048_high_score: Option<late_core::models::twenty_forty_eight::HighScore>,
-    pub tetris_service: crate::app::games::tetris::svc::TetrisService,
+    pub tetris_service: crate::app::arcade::tetris::svc::TetrisService,
+    pub snake_service: crate::app::arcade::snake::svc::SnakeService,
     pub initial_tetris_game: Option<late_core::models::tetris::Game>,
+    pub initial_snake_game: Option<late_core::models::snake::Game>,
     pub initial_tetris_high_score: Option<late_core::models::tetris::HighScore>,
-    pub sudoku_service: crate::app::games::sudoku::svc::SudokuService,
+    pub initial_snake_high_score: Option<late_core::models::snake::HighScore>,
+    pub sudoku_service: crate::app::arcade::sudoku::svc::SudokuService,
     pub initial_sudoku_games: Vec<late_core::models::sudoku::Game>,
-    pub nonogram_service: crate::app::games::nonogram::svc::NonogramService,
+    pub nonogram_service: crate::app::arcade::nonogram::svc::NonogramService,
     pub initial_nonogram_games: Vec<late_core::models::nonogram::Game>,
-    pub solitaire_service: crate::app::games::solitaire::svc::SolitaireService,
+    pub solitaire_service: crate::app::arcade::solitaire::svc::SolitaireService,
     pub initial_solitaire_games: Vec<late_core::models::solitaire::Game>,
-    pub minesweeper_service: crate::app::games::minesweeper::svc::MinesweeperService,
+    pub minesweeper_service: crate::app::arcade::minesweeper::svc::MinesweeperService,
     pub initial_minesweeper_games: Vec<late_core::models::minesweeper::Game>,
     pub rooms_service: crate::app::rooms::svc::RoomsService,
-    pub blackjack_table_manager: crate::app::rooms::blackjack::manager::BlackjackTableManager,
+    pub room_game_registry: crate::app::rooms::registry::RoomGameRegistry,
     /// Shared in-proc dartboard server handle. Each session only connects — consuming a
     /// color slot and showing up in `peer_count` — when the user actually
     /// enters the dartboard game from the arcade.
@@ -142,7 +176,7 @@ pub struct SessionConfig {
     pub bonsai_service: crate::app::bonsai::svc::BonsaiService,
     pub initial_bonsai_tree: Option<late_core::models::bonsai::Tree>,
     pub initial_bonsai_care: Option<late_core::models::bonsai::DailyCare>,
-    pub nonogram_library: crate::app::games::nonogram::state::Library,
+    pub nonogram_library: crate::app::arcade::nonogram::state::Library,
     pub initial_chip_balance: i64,
 
     /// Session / connection
@@ -155,6 +189,7 @@ pub struct SessionConfig {
     pub now_playing_rx: Option<tokio::sync::watch::Receiver<Option<NowPlaying>>>,
     pub active_users: Option<ActiveUsers>,
     pub activity_feed_rx: Option<broadcast::Receiver<ActivityEvent>>,
+    pub initial_activity: VecDeque<ActivityEvent>,
     pub user_id: Uuid,
     pub permissions: Permissions,
     pub artboard_banned: bool,
@@ -192,9 +227,14 @@ pub struct App {
     pub(crate) show_quit_confirm: bool,
     pub(crate) show_help: bool,
     pub(crate) show_mod_modal: bool,
+    pub(crate) show_hub_modal: bool,
     pub(crate) show_profile_modal: bool,
     pub(crate) show_bonsai_modal: bool,
+    pub(crate) show_terminal_help: bool,
     pub(crate) help_modal_state: help_modal::state::HelpModalState,
+    pub(crate) hub_state: hub::state::HubState,
+    pub(crate) terminal_help_modal_state:
+        crate::app::terminal_help_modal::state::TerminalHelpModalState,
     pub(crate) mod_modal_state: mod_modal::state::ModModalState,
     pub(crate) pending_escape: bool,
     pub(crate) pending_escape_started_at: Option<Instant>,
@@ -214,13 +254,14 @@ pub struct App {
     pub(super) web_chat_registry: Option<WebChatRegistry>,
     pub(crate) show_web_chat_qr: bool,
     pub(crate) web_chat_qr_url: Option<String>,
-    pub(crate) show_cli_install_modal: bool,
+    pub(crate) show_pair_modal: bool,
     pub(super) session_token: String,
     pub(super) session_rx: Option<tokio::sync::mpsc::Receiver<SessionMessage>>,
     pub(super) now_playing_rx: Option<tokio::sync::watch::Receiver<Option<NowPlaying>>>,
     pub(super) active_users: Option<ActiveUsers>,
     pub(super) activity_feed_rx: Option<broadcast::Receiver<ActivityEvent>>,
     pub(super) activity: VecDeque<ActivityEvent>,
+    pub(crate) audio: crate::app::audio::state::AudioState,
     pub(crate) user_id: Uuid,
     pub(crate) permissions: Permissions,
     pub(crate) is_admin: bool,
@@ -236,23 +277,10 @@ pub struct App {
     pub(crate) dashboard_chat_rows_cache: chat::ui::ChatRowsCache,
     pub(crate) active_room_rows_cache: chat::ui::ChatRowsCache,
     pub(crate) rooms_chat_rows_cache: chat::ui::ChatRowsCache,
+    pub(crate) room_search_modal_state: crate::app::room_search_modal::state::RoomSearchModalState,
 
-    /// Which favorite room the dashboard's chat card is currently showing,
-    /// when the user has 2+ favorites pinned. Clamped on read against the
-    /// current profile list so it stays valid after adds/removes. Session-
-    /// local — not persisted.
-    pub(crate) dashboard_favorite_index: usize,
-    /// Previously-active favorite index, so `,` can jump back to the last
-    /// pin Vim-alternate-buffer style. Session-local.
-    pub(crate) dashboard_previous_favorite_index: Option<usize>,
-    /// `true` while the user has pressed `g` on the dashboard and we're
-    /// waiting for a digit to complete a jump (Vim-style two-key prefix).
-    /// Any non-digit keystroke disarms and falls through to its normal
-    /// handling.
-    pub(crate) dashboard_g_prefix_armed: bool,
-    /// `true` after `b` on the dashboard, waiting for a blackjack room slot
-    /// key (`1..9`, `0`, `-`, `=`, `[`, `]`, `\`).
-    pub(crate) dashboard_blackjack_prefix_armed: bool,
+    pub(crate) vote_prefix_armed: bool,
+    pub(crate) hot_room_prefix_armed: bool,
 
     /// Profile
     pub(crate) profile_state: profile::state::ProfileState,
@@ -267,21 +295,16 @@ pub struct App {
     pub(crate) bonsai_state: crate::app::bonsai::state::BonsaiState,
     pub(crate) bonsai_care_state: crate::app::bonsai::care::BonsaiCareState,
 
-    /// Games Hub
+    /// Arcade Hub
     pub(crate) game_selection: usize,
     pub(crate) is_playing_game: bool,
     pub(crate) dashboard_game_toggle_target: Option<DashboardGameToggleTarget>,
     pub(crate) rooms_service: crate::app::rooms::svc::RoomsService,
-    pub(crate) blackjack_table_manager:
-        crate::app::rooms::blackjack::manager::BlackjackTableManager,
+    pub(crate) room_game_registry: crate::app::rooms::registry::RoomGameRegistry,
     pub(crate) rooms_selected_index: usize,
     pub(crate) rooms_active_room: Option<crate::app::rooms::svc::RoomListItem>,
     pub(crate) rooms_last_active_room_id: Option<Uuid>,
-    pub(crate) rooms_add_form_open: bool,
-    pub(crate) rooms_display_name_input: String,
-    pub(crate) rooms_create_focus_index: usize,
-    pub(crate) rooms_create_pace_index: usize,
-    pub(crate) rooms_create_stake_index: usize,
+    pub(crate) rooms_create_flow: Option<crate::app::rooms::backend::CreateRoomFlow>,
     pub(crate) rooms_filter: crate::app::rooms::filter::RoomsFilter,
     pub(crate) rooms_search_active: bool,
     pub(crate) rooms_search_query: String,
@@ -289,13 +312,14 @@ pub struct App {
         tokio::sync::watch::Receiver<crate::app::rooms::svc::RoomsSnapshot>,
     pub(super) rooms_event_rx: tokio::sync::broadcast::Receiver<crate::app::rooms::svc::RoomsEvent>,
     pub(crate) rooms_snapshot: crate::app::rooms::svc::RoomsSnapshot,
-    pub(crate) twenty_forty_eight_state: crate::app::games::twenty_forty_eight::state::State,
-    pub(crate) tetris_state: crate::app::games::tetris::state::State,
-    pub(crate) sudoku_state: crate::app::games::sudoku::state::State,
-    pub(crate) nonogram_state: crate::app::games::nonogram::state::State,
-    pub(crate) solitaire_state: crate::app::games::solitaire::state::State,
-    pub(crate) minesweeper_state: crate::app::games::minesweeper::state::State,
-    pub(crate) blackjack_state: Option<crate::app::rooms::blackjack::state::State>,
+    pub(crate) twenty_forty_eight_state: crate::app::arcade::twenty_forty_eight::state::State,
+    pub(crate) tetris_state: crate::app::arcade::tetris::state::State,
+    pub(crate) snake_state: crate::app::arcade::snake::state::State,
+    pub(crate) sudoku_state: crate::app::arcade::sudoku::state::State,
+    pub(crate) nonogram_state: crate::app::arcade::nonogram::state::State,
+    pub(crate) solitaire_state: crate::app::arcade::solitaire::state::State,
+    pub(crate) minesweeper_state: crate::app::arcade::minesweeper::state::State,
+    pub(crate) active_room_game: Option<Box<dyn crate::app::rooms::backend::ActiveRoomBackend>>,
     /// `Some` while the user is inside the dartboard game, `None` otherwise.
     /// Constructed on entry (connecting + consuming a color slot) and
     /// dropped on leave (firing `server.disconnect()` via `LocalClient`'s
@@ -345,33 +369,13 @@ impl App {
         self.show_splash = false;
         self.show_settings = false;
         self.show_quit_confirm = false;
+        self.show_hub_modal = false;
         self.show_bonsai_modal = false;
-    }
-
-    /// Resolves which room the dashboard's chat card should display, given
-    /// the user's pinned favorites:
-    /// - 0 pins → `#general`
-    /// - 1 pin → that pin (or `#general` if it was left)
-    /// - 2+ pins → favorites[index], clamped against the current list
-    ///
-    /// The strip only renders in the 2+ case; see [`Self::dashboard_strip_pins`].
-    pub(crate) fn dashboard_active_room_id(&self) -> Option<uuid::Uuid> {
-        let pins = &self.profile_state.profile().favorite_room_ids;
-        let general = self.chat.general_room_id();
-        match pins.len() {
-            0 => general,
-            1 => self.resolve_joined_room(pins[0]).or(general),
-            len => {
-                let idx = self.dashboard_favorite_index.min(len - 1);
-                self.resolve_joined_room(pins[idx]).or(general)
-            }
-        }
     }
 
     fn current_visible_chat_room_id(&self) -> Option<Uuid> {
         match self.screen {
-            Screen::Dashboard => self.dashboard_active_room_id(),
-            Screen::Chat => self.chat.selected_room_id,
+            Screen::Dashboard => self.chat.selected_room_id,
             Screen::Rooms => self
                 .rooms_active_room
                 .as_ref()
@@ -390,119 +394,6 @@ impl App {
         }
     }
 
-    /// Pins to render in the dashboard quick-switch strip. `None` when fewer
-    /// than two favorites are pinned — there's nothing to switch between, so
-    /// the strip is hidden entirely.
-    pub(crate) fn dashboard_strip_pins(&self) -> Option<Vec<(uuid::Uuid, String, bool, i64)>> {
-        let pins = &self.profile_state.profile().favorite_room_ids;
-        if pins.len() < 2 {
-            return None;
-        }
-        let catalog = self.chat.favorite_room_options();
-        let active = self.dashboard_active_room_id();
-        let pills: Vec<(uuid::Uuid, String, bool, i64)> = pins
-            .iter()
-            .filter_map(|id| {
-                catalog
-                    .iter()
-                    .find(|option| option.id == *id)
-                    .map(|option| {
-                        let is_active = Some(option.id) == active;
-                        let unread = if is_active {
-                            0
-                        } else {
-                            self.chat
-                                .unread_counts
-                                .get(&option.id)
-                                .copied()
-                                .unwrap_or(0)
-                        };
-                        (option.id, option.label.clone(), is_active, unread)
-                    })
-            })
-            .collect();
-        // If membership churn leaves <2 resolvable pins, hide the strip
-        // rather than show a lonely pill.
-        if pills.len() < 2 { None } else { Some(pills) }
-    }
-
-    /// Cycle the dashboard's active favorite. Wraps both directions. No-op
-    /// when fewer than two pins are present.
-    pub(crate) fn cycle_dashboard_favorite(&mut self, delta: isize) {
-        let len = self.profile_state.profile().favorite_room_ids.len();
-        if len < 2 {
-            return;
-        }
-        let len_isize = len as isize;
-        let current = self.dashboard_favorite_index.min(len - 1) as isize;
-        let next = ((current + delta).rem_euclid(len_isize)) as usize;
-        if next != current as usize {
-            self.dashboard_previous_favorite_index = Some(current as usize);
-        }
-        self.dashboard_favorite_index = next;
-    }
-
-    /// Jump directly to `slot` (0-indexed) in the favorites list. Used by
-    /// the `g<digit>` prefix. No-op when <2 pins or the slot is out of
-    /// range. Records the current pin as the "last" target so `,` bounces
-    /// back afterward.
-    pub(crate) fn jump_dashboard_favorite(&mut self, slot: usize) {
-        let len = self.profile_state.profile().favorite_room_ids.len();
-        if len < 2 || slot >= len {
-            return;
-        }
-        let current = self.dashboard_favorite_index.min(len - 1);
-        if slot == current {
-            return;
-        }
-        self.dashboard_previous_favorite_index = Some(current);
-        self.dashboard_favorite_index = slot;
-    }
-
-    pub(crate) fn select_dashboard_favorite_room(&mut self, room_id: Uuid) {
-        let Some(slot) = self
-            .profile_state
-            .profile()
-            .favorite_room_ids
-            .iter()
-            .position(|id| *id == room_id)
-        else {
-            return;
-        };
-        self.jump_dashboard_favorite(slot);
-    }
-
-    /// Vim-alternate-buffer style jump: swap the current and previous
-    /// active pin. No-op when fewer than two pins are present or there's
-    /// no prior pin to jump back to (first tap of this session).
-    pub(crate) fn toggle_dashboard_last_favorite(&mut self) {
-        let len = self.profile_state.profile().favorite_room_ids.len();
-        if len < 2 {
-            return;
-        }
-        let Some(prev) = self.dashboard_previous_favorite_index else {
-            return;
-        };
-        let prev = prev.min(len - 1);
-        let current = self.dashboard_favorite_index.min(len - 1);
-        if prev == current {
-            return;
-        }
-        self.dashboard_previous_favorite_index = Some(current);
-        self.dashboard_favorite_index = prev;
-    }
-
-    /// Returns `room_id` if the user is currently a member of it; `None`
-    /// otherwise. Used to guard against a pin that survived in the profile
-    /// but vanished from the joined-rooms snapshot (left via `/leave`, etc).
-    fn resolve_joined_room(&self, room_id: uuid::Uuid) -> Option<uuid::Uuid> {
-        self.chat
-            .favorite_room_options()
-            .iter()
-            .any(|option| option.id == room_id)
-            .then_some(room_id)
-    }
-
     pub fn show_splash_for_tests(&mut self, hint: impl Into<String>) {
         self.show_splash = true;
         self.show_settings = false;
@@ -511,7 +402,7 @@ impl App {
         self.splash_hint = hint.into();
     }
 
-    pub fn new(config: SessionConfig) -> anyhow::Result<Self> {
+    pub fn new(mut config: SessionConfig) -> anyhow::Result<Self> {
         let (cols, rows) = if config.cols == 0 || config.rows == 0 {
             tracing::warn!(
                 config.cols,
@@ -524,6 +415,9 @@ impl App {
         };
         tracing::debug!(cols, rows, "initializing app");
 
+        let activity =
+            seed_activity_from_history(config.initial_activity, config.activity_feed_rx.as_mut());
+
         let shared = SharedBuffer::default();
         let backend = CrosstermBackend::new(shared.clone());
         let viewport = Viewport::Fixed(Rect::new(0, 0, cols, rows));
@@ -531,7 +425,7 @@ impl App {
             .context("failed to create terminal backend")?;
 
         let twenty_forty_eight_state = if let Some(game) = config.initial_2048_game {
-            crate::app::games::twenty_forty_eight::state::State::restore(
+            crate::app::arcade::twenty_forty_eight::state::State::restore(
                 config.user_id,
                 config.twenty_forty_eight_service.clone(),
                 game.score,
@@ -544,7 +438,7 @@ impl App {
                 game.is_game_over,
             )
         } else {
-            crate::app::games::twenty_forty_eight::state::State::new(
+            crate::app::arcade::twenty_forty_eight::state::State::new(
                 config.user_id,
                 config.twenty_forty_eight_service.clone(),
                 config
@@ -556,7 +450,7 @@ impl App {
         };
 
         let tetris_state = if let Some(game) = config.initial_tetris_game {
-            crate::app::games::tetris::state::State::restore(
+            crate::app::arcade::tetris::state::State::restore(
                 config.user_id,
                 config.tetris_service.clone(),
                 config
@@ -567,7 +461,7 @@ impl App {
                 game,
             )
         } else {
-            crate::app::games::tetris::state::State::new(
+            crate::app::arcade::tetris::state::State::new(
                 config.user_id,
                 config.tetris_service.clone(),
                 config
@@ -577,24 +471,46 @@ impl App {
                     .unwrap_or(0),
             )
         };
-
-        let sudoku_state = crate::app::games::sudoku::state::State::new(
+        let snake_best_score = config
+            .initial_snake_high_score
+            .as_ref()
+            .map(|score| score.score)
+            .unwrap_or(0);
+        let snake_state = if let Some(game) = config.initial_snake_game {
+            crate::app::arcade::snake::state::State::restore(
+                config.user_id,
+                config.snake_service.clone(),
+                snake_best_score,
+                25,
+                60,
+                game,
+            )
+        } else {
+            crate::app::arcade::snake::state::State::new(
+                config.user_id,
+                config.snake_service.clone(),
+                snake_best_score,
+                25,
+                60,
+            )
+        };
+        let sudoku_state = crate::app::arcade::sudoku::state::State::new(
             config.user_id,
             config.sudoku_service.clone(),
             config.initial_sudoku_games,
         );
-        let nonogram_state = crate::app::games::nonogram::state::State::new(
+        let nonogram_state = crate::app::arcade::nonogram::state::State::new(
             config.user_id,
             config.nonogram_service.clone(),
             config.nonogram_library,
             config.initial_nonogram_games,
         );
-        let solitaire_state = crate::app::games::solitaire::state::State::new(
+        let solitaire_state = crate::app::arcade::solitaire::state::State::new(
             config.user_id,
             config.solitaire_service.clone(),
             config.initial_solitaire_games,
         );
-        let minesweeper_state = crate::app::games::minesweeper::state::State::new(
+        let minesweeper_state = crate::app::arcade::minesweeper::state::State::new(
             config.user_id,
             config.minesweeper_service.clone(),
             config.initial_minesweeper_games,
@@ -657,13 +573,10 @@ impl App {
         };
         let mut settings_modal_state = settings_modal::state::SettingsModalState::new(
             config.profile_service.clone(),
+            config.feed_service.clone(),
             config.user_id,
         );
-        settings_modal_state.open_from_profile(
-            &initial_profile,
-            Vec::new(),
-            settings_modal::ui::MODAL_WIDTH,
-        );
+        settings_modal_state.open_from_profile(&initial_profile);
         let mut app = Self {
             running: true,
             size: (cols, rows),
@@ -676,9 +589,14 @@ impl App {
             show_quit_confirm: false,
             show_help: false,
             show_mod_modal: false,
+            show_hub_modal: false,
             show_profile_modal: false,
             show_bonsai_modal: false,
+            show_terminal_help: false,
             help_modal_state: help_modal::state::HelpModalState::new(),
+            hub_state: hub::state::HubState::new(),
+            terminal_help_modal_state:
+                crate::app::terminal_help_modal::state::TerminalHelpModalState::new(),
             mod_modal_state: mod_modal::state::ModModalState::new(),
             pending_escape: false,
             pending_escape_started_at: None,
@@ -694,13 +612,14 @@ impl App {
             web_chat_registry: config.web_chat_registry,
             show_web_chat_qr: false,
             web_chat_qr_url: None,
-            show_cli_install_modal: false,
+            show_pair_modal: false,
             session_token: config.session_token,
             session_rx: config.session_rx,
             now_playing_rx: config.now_playing_rx,
             active_users: active_users.clone(),
             activity_feed_rx: config.activity_feed_rx,
-            activity: VecDeque::new(),
+            activity,
+            audio: crate::app::audio::state::AudioState::new(config.audio_service, config.user_id),
             user_id: config.user_id,
             permissions: config.permissions,
             is_admin: config.permissions.is_admin(),
@@ -709,21 +628,25 @@ impl App {
             artboard_ban_expires_at: config.artboard_ban_expires_at,
             vote: vote::state::VoteState::new(config.vote_service, config.user_id, config.my_vote),
             chat: chat::state::ChatState::new(
-                config.chat_service,
-                config.notification_service,
+                chat::state::ChatServices {
+                    chat: config.chat_service,
+                    notifications: config.notification_service,
+                    articles: config.article_service.clone(),
+                    feeds: config.feed_service.clone(),
+                    showcases: config.showcase_service.clone(),
+                    work: config.work_service.clone(),
+                },
                 config.user_id,
                 config.permissions,
                 active_users.clone(),
-                config.article_service.clone(),
-                config.showcase_service.clone(),
             ),
             dashboard_chat_rows_cache: chat::ui::ChatRowsCache::default(),
             active_room_rows_cache: chat::ui::ChatRowsCache::default(),
             rooms_chat_rows_cache: chat::ui::ChatRowsCache::default(),
-            dashboard_favorite_index: 0,
-            dashboard_previous_favorite_index: None,
-            dashboard_g_prefix_armed: false,
-            dashboard_blackjack_prefix_armed: false,
+            room_search_modal_state:
+                crate::app::room_search_modal::state::RoomSearchModalState::default(),
+            vote_prefix_armed: false,
+            hot_room_prefix_armed: false,
             profile_state: profile::state::ProfileState::new(
                 config.profile_service.clone(),
                 config.user_id,
@@ -742,15 +665,11 @@ impl App {
             is_playing_game: false,
             dashboard_game_toggle_target: None,
             rooms_service: config.rooms_service,
-            blackjack_table_manager: config.blackjack_table_manager,
+            room_game_registry: config.room_game_registry,
             rooms_selected_index: 0,
             rooms_active_room: None,
             rooms_last_active_room_id: None,
-            rooms_add_form_open: false,
-            rooms_display_name_input: String::new(),
-            rooms_create_focus_index: 0,
-            rooms_create_pace_index: 1,
-            rooms_create_stake_index: 0,
+            rooms_create_flow: None,
             rooms_filter: crate::app::rooms::filter::RoomsFilter::default(),
             rooms_search_active: false,
             rooms_search_query: String::new(),
@@ -759,11 +678,12 @@ impl App {
             rooms_snapshot,
             twenty_forty_eight_state,
             tetris_state,
+            snake_state,
             sudoku_state,
             nonogram_state,
             solitaire_state,
             minesweeper_state,
-            blackjack_state: None,
+            active_room_game: None,
             dartboard_state: None,
             artboard_interacting: false,
             dartboard_server,
@@ -783,9 +703,9 @@ impl App {
         if app.screen == Screen::Artboard {
             app.enter_dartboard();
         }
-        if app.screen == Screen::Dashboard {
-            app.chat.request_pinned_messages();
-        }
+        app.chat
+            .set_favorite_room_ids(app.profile_state.profile().favorite_room_ids.clone());
+        app.chat.sync_selection();
         app.sync_visible_chat_room();
         Ok(app)
     }
@@ -924,13 +844,9 @@ impl App {
 
         self.screen = screen;
 
-        if self.screen == Screen::Chat {
+        if matches!(self.screen, Screen::Dashboard) {
             self.chat.request_list();
             self.chat.sync_selection();
-        }
-
-        if self.screen == Screen::Dashboard {
-            self.chat.request_pinned_messages();
         }
 
         if self.screen == Screen::Artboard {
@@ -972,6 +888,17 @@ impl App {
             return false;
         };
         registry.send_control(&self.session_token, PairControlMessage::VolumeDown)
+    }
+
+    pub fn request_paired_clipboard_image_upload(&mut self, room_id: Option<Uuid>) -> bool {
+        let Some(registry) = &self.paired_client_registry else {
+            return false;
+        };
+        if registry.request_clipboard_image(&self.session_token) {
+            self.chat.begin_pending_clipboard_image_upload(room_id);
+            return true;
+        }
+        false
     }
 
     pub fn paired_client_state(&self) -> Option<ClientAudioState> {
@@ -1114,6 +1041,39 @@ mod tests {
             NotificationMode::from_format(Some("garbage")),
             NotificationMode::Both
         );
+    }
+
+    #[test]
+    fn seed_activity_from_history_drops_events_already_in_history() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let event = ActivityEvent::joined(uuid::Uuid::nil(), "alice");
+        tx.send(event.clone()).expect("send activity");
+        let mut history = VecDeque::new();
+        history.push_back(event);
+
+        let activity = seed_activity_from_history(history, Some(&mut rx));
+
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].username, "alice");
+    }
+
+    #[test]
+    fn seed_activity_from_history_keeps_events_newer_than_history() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let old = ActivityEvent::joined(uuid::Uuid::nil(), "alice");
+        let mut history = VecDeque::new();
+        history.push_back(old);
+        let mut fresh = ActivityEvent::joined(uuid::Uuid::from_u128(1), "bob");
+        fresh.at = history.back().map_or(fresh.at, |event| {
+            event.at + std::time::Duration::from_secs(1)
+        });
+        tx.send(fresh).expect("send activity");
+
+        let activity = seed_activity_from_history(history, Some(&mut rx));
+
+        assert_eq!(activity.len(), 2);
+        assert_eq!(activity[0].username, "alice");
+        assert_eq!(activity[1].username, "bob");
     }
 
     #[test]

@@ -6,33 +6,39 @@ use late_core::{
     rate_limit::IpRateLimiter,
     test_utils::{TestDb, test_db},
 };
+use late_ssh::app::LeaderboardService;
+use late_ssh::app::activity::event::ActivityEvent;
+use late_ssh::app::activity::publisher::ActivityPublisher;
 use late_ssh::app::ai::svc::AiService;
+use late_ssh::app::arcade::chips::svc::ChipService;
+use late_ssh::app::arcade::minesweeper::svc::MinesweeperService;
+use late_ssh::app::arcade::nonogram::state::Library as NonogramLibrary;
+use late_ssh::app::arcade::nonogram::svc::NonogramService;
+use late_ssh::app::arcade::snake::svc::SnakeService;
+use late_ssh::app::arcade::solitaire::svc::SolitaireService;
+use late_ssh::app::arcade::sudoku::svc::SudokuService;
+use late_ssh::app::arcade::tetris::svc::TetrisService;
+use late_ssh::app::arcade::twenty_forty_eight::svc::TwentyFortyEightService;
 use late_ssh::app::artboard::provenance::ArtboardProvenance;
 use late_ssh::app::bonsai::svc::BonsaiService;
 use late_ssh::app::chat::news::svc::ArticleService;
 use late_ssh::app::chat::notifications::svc::NotificationService;
 use late_ssh::app::chat::svc::ChatService;
-use late_ssh::app::games::chips::svc::ChipService;
-use late_ssh::app::games::leaderboard::svc::LeaderboardService;
-use late_ssh::app::games::minesweeper::svc::MinesweeperService;
-use late_ssh::app::games::nonogram::state::Library as NonogramLibrary;
-use late_ssh::app::games::nonogram::svc::NonogramService;
-use late_ssh::app::games::solitaire::svc::SolitaireService;
-use late_ssh::app::games::sudoku::svc::SudokuService;
-use late_ssh::app::games::tetris::svc::TetrisService;
-use late_ssh::app::games::twenty_forty_eight::svc::TwentyFortyEightService;
 use late_ssh::app::profile::svc::ProfileService;
 use late_ssh::app::rooms::blackjack::manager::BlackjackTableManager;
 use late_ssh::app::rooms::blackjack::player::BlackjackPlayerDirectory;
+use late_ssh::app::rooms::poker::manager::PokerTableManager;
+use late_ssh::app::rooms::registry::RoomGameRegistry;
 use late_ssh::app::rooms::svc::RoomsService;
+use late_ssh::app::rooms::tictactoe::manager::TicTacToeTableManager;
 use late_ssh::app::state::{App, SessionConfig};
 use late_ssh::app::vote::svc::VoteService;
 use late_ssh::authz::Permissions;
-use late_ssh::config::{AiConfig, Config};
-use late_ssh::session::{PairControlMessage, PairedClientRegistry, SessionRegistry};
-use late_ssh::state::ActivityEvent;
+use late_ssh::config::{AiConfig, Config, WebTunnelConfig};
+use late_ssh::paired_clients::{PairControlMessage, PairedClientRegistry};
+use late_ssh::session::SessionRegistry;
 use late_ssh::state::State;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{Semaphore, broadcast, watch};
@@ -49,6 +55,22 @@ fn test_dartboard_server() -> dartboard_local::ServerHandle {
 
 fn test_dartboard_provenance() -> late_ssh::app::artboard::provenance::SharedArtboardProvenance {
     ArtboardProvenance::default().shared()
+}
+
+fn test_room_game_registry(db: Db) -> RoomGameRegistry {
+    let chip_service = ChipService::new(db.clone());
+    let (activity_tx, _) = broadcast::channel::<ActivityEvent>(64);
+    let activity_publisher = ActivityPublisher::new(db.clone(), activity_tx);
+    let blackjack_table_manager = BlackjackTableManager::new(
+        chip_service.clone(),
+        BlackjackPlayerDirectory::new(db),
+        activity_publisher.clone(),
+    );
+    RoomGameRegistry::new(
+        blackjack_table_manager,
+        PokerTableManager::new(chip_service, activity_publisher.clone()),
+        TicTacToeTableManager::new(activity_publisher),
+    )
 }
 
 pub fn test_config(db_config: late_core::db::DbConfig) -> Config {
@@ -74,11 +96,17 @@ pub fn test_config(db_config: late_core::db::DbConfig) -> Config {
         ssh_proxy_trusted_cidrs: vec![],
         ws_pair_max_attempts_per_ip: 30,
         ws_pair_rate_limit_window_secs: 60,
+        web_tunnel: WebTunnelConfig {
+            token: "test-web-tunnel-token".to_string(),
+            username: "web-demo".to_string(),
+            fingerprint: "web-tunnel-demo".to_string(),
+        },
         ai: AiConfig {
             enabled: false,
             api_key: None,
             model: "gemini-3.1-pro-preview".to_string(),
         },
+        youtube_api_key: None,
     }
 }
 
@@ -102,7 +130,9 @@ pub fn test_app_state(db: Db, config: Config) -> State {
     .with_session_registry(session_registry.clone());
     let ai_service = AiService::new(false, None, "gemini-3.1-pro-preview".to_string());
     let article_service = ArticleService::new(db.clone(), ai_service.clone(), chat_service.clone());
+    let feed_service = late_ssh::app::chat::feeds::svc::FeedService::new(db.clone());
     let showcase_service = late_ssh::app::chat::showcase::svc::ShowcaseService::new(db.clone());
+    let work_service = late_ssh::app::chat::work::svc::WorkService::new(db.clone());
     let ssh_attempt_limiter = IpRateLimiter::new(
         config.ssh_max_attempts_per_ip,
         config.ssh_rate_limit_window_secs,
@@ -112,14 +142,20 @@ pub fn test_app_state(db: Db, config: Config) -> State {
         config.ws_pair_rate_limit_window_secs,
     );
     let (_, now_playing_rx) = watch::channel::<Option<NowPlaying>>(None);
-    let profile_service = ProfileService::new(db.clone(), active_users.clone());
+    let profile_service = ProfileService::new(db.clone(), active_users.clone())
+        .with_session_registry(session_registry.clone());
     let twenty_forty_eight_service = TwentyFortyEightService::new(db.clone());
     let tetris_service = TetrisService::new(db.clone());
+    let snake_service = SnakeService::new(db.clone());
     let chip_service = ChipService::new(db.clone());
     let rooms_service = RoomsService::new(db.clone());
     let blackjack_player_directory = BlackjackPlayerDirectory::new(db.clone());
-    let blackjack_table_manager =
-        BlackjackTableManager::new(chip_service.clone(), blackjack_player_directory.clone());
+    let activity_publisher = ActivityPublisher::new(db.clone(), activity_tx.clone());
+    let blackjack_table_manager = BlackjackTableManager::new(
+        chip_service.clone(),
+        blackjack_player_directory.clone(),
+        activity_publisher.clone(),
+    );
     let sudoku_service = SudokuService::new(db.clone(), activity_tx.clone(), chip_service.clone());
     let nonogram_service =
         NonogramService::new(db.clone(), activity_tx.clone(), chip_service.clone());
@@ -135,30 +171,40 @@ pub fn test_app_state(db: Db, config: Config) -> State {
         conn_counts: Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new())),
         active_users,
         config,
-        db,
+        db: db.clone(),
+        audio_service: late_ssh::app::audio::svc::AudioService::new(db.clone(), None),
         vote_service,
         chat_service,
         notification_service,
         ai_service,
         article_service,
+        feed_service,
         showcase_service,
+        work_service,
         profile_service,
         twenty_forty_eight_service,
         tetris_service,
+        snake_service,
         sudoku_service,
         nonogram_service,
         solitaire_service,
         minesweeper_service,
         bonsai_service,
         nonogram_library: NonogramLibrary::default(),
-        chip_service,
+        chip_service: chip_service.clone(),
         rooms_service,
-        blackjack_table_manager,
+        blackjack_table_manager: blackjack_table_manager.clone(),
+        room_game_registry: RoomGameRegistry::new(
+            blackjack_table_manager,
+            PokerTableManager::new(chip_service.clone(), activity_publisher.clone()),
+            TicTacToeTableManager::new(activity_publisher),
+        ),
         dartboard_server,
         dartboard_provenance: test_dartboard_provenance(),
         leaderboard_service,
         now_playing_rx,
         activity_feed: activity_tx,
+        activity_history: Arc::new(Mutex::new(VecDeque::new())),
         session_registry,
         paired_client_registry: PairedClientRegistry::new(),
         web_chat_registry: late_ssh::web::WebChatRegistry::new(),
@@ -181,6 +227,7 @@ pub fn make_app_with_chat_service(
     let mut app = App::new(SessionConfig {
         cols: 100,
         rows: 32,
+        audio_service: late_ssh::app::audio::svc::AudioService::new(db.clone(), None),
         vote_service: VoteService::new(
             db.clone(),
             "127.0.0.1:0".to_string(),
@@ -195,14 +242,19 @@ pub fn make_app_with_chat_service(
             AiService::new(false, None, "gemini-3.1-pro-preview".to_string()),
             chat_service.clone(),
         ),
+        feed_service: late_ssh::app::chat::feeds::svc::FeedService::new(db.clone()),
         showcase_service: late_ssh::app::chat::showcase::svc::ShowcaseService::new(db.clone()),
+        work_service: late_ssh::app::chat::work::svc::WorkService::new(db.clone()),
         profile_service: ProfileService::new(db.clone(), Arc::new(Mutex::new(HashMap::new()))),
         twenty_forty_eight_service: TwentyFortyEightService::new(db.clone()),
         initial_2048_game: None,
         initial_2048_high_score: None,
         tetris_service: TetrisService::new(db.clone()),
+        snake_service: SnakeService::new(db.clone()),
         initial_tetris_game: None,
+        initial_snake_game: None,
         initial_tetris_high_score: None,
+        initial_snake_high_score: None,
         sudoku_service: SudokuService::new(
             db.clone(),
             broadcast::channel::<ActivityEvent>(64).0,
@@ -228,10 +280,7 @@ pub fn make_app_with_chat_service(
         ),
         initial_minesweeper_games: Vec::new(),
         rooms_service: RoomsService::new(db.clone()),
-        blackjack_table_manager: BlackjackTableManager::new(
-            ChipService::new(db.clone()),
-            BlackjackPlayerDirectory::new(db.clone()),
-        ),
+        room_game_registry: test_room_game_registry(db.clone()),
         dartboard_server: test_dartboard_server(),
         dartboard_provenance: test_dartboard_provenance(),
         artboard_snapshot_service: late_ssh::app::artboard::svc::ArtboardSnapshotService::new(
@@ -258,6 +307,7 @@ pub fn make_app_with_chat_service(
         my_vote: None,
         active_users: None,
         activity_feed_rx: None,
+        initial_activity: VecDeque::new(),
         is_new_user: false,
         is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         initial_theme_id: "contrast".to_string(),
@@ -282,6 +332,7 @@ pub fn make_app_with_paired_client(
     let mut app = App::new(SessionConfig {
         cols: 100,
         rows: 32,
+        audio_service: late_ssh::app::audio::svc::AudioService::new(db.clone(), None),
         vote_service: VoteService::new(
             db.clone(),
             "127.0.0.1:0".to_string(),
@@ -296,14 +347,19 @@ pub fn make_app_with_paired_client(
             AiService::new(false, None, "gemini-3.1-pro-preview".to_string()),
             ChatService::new(db.clone(), NotificationService::new(db.clone())),
         ),
+        feed_service: late_ssh::app::chat::feeds::svc::FeedService::new(db.clone()),
         showcase_service: late_ssh::app::chat::showcase::svc::ShowcaseService::new(db.clone()),
+        work_service: late_ssh::app::chat::work::svc::WorkService::new(db.clone()),
         profile_service: ProfileService::new(db.clone(), Arc::new(Mutex::new(HashMap::new()))),
         twenty_forty_eight_service: TwentyFortyEightService::new(db.clone()),
         initial_2048_game: None,
         initial_2048_high_score: None,
         tetris_service: TetrisService::new(db.clone()),
+        snake_service: SnakeService::new(db.clone()),
         initial_tetris_game: None,
+        initial_snake_game: None,
         initial_tetris_high_score: None,
+        initial_snake_high_score: None,
         sudoku_service: SudokuService::new(
             db.clone(),
             broadcast::channel::<ActivityEvent>(64).0,
@@ -329,10 +385,7 @@ pub fn make_app_with_paired_client(
         ),
         initial_minesweeper_games: Vec::new(),
         rooms_service: RoomsService::new(db.clone()),
-        blackjack_table_manager: BlackjackTableManager::new(
-            ChipService::new(db.clone()),
-            BlackjackPlayerDirectory::new(db.clone()),
-        ),
+        room_game_registry: test_room_game_registry(db.clone()),
         dartboard_server: test_dartboard_server(),
         dartboard_provenance: test_dartboard_provenance(),
         artboard_snapshot_service: late_ssh::app::artboard::svc::ArtboardSnapshotService::new(
@@ -359,6 +412,7 @@ pub fn make_app_with_paired_client(
         my_vote: None,
         active_users: None,
         activity_feed_rx: None,
+        initial_activity: VecDeque::new(),
         is_new_user: false,
         is_draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         initial_theme_id: "contrast".to_string(),
@@ -400,8 +454,7 @@ pub async fn chat_compose_app(name: &str) -> (TestDb, App) {
         .expect("join general room");
 
     let mut app = make_app(test_db.db.clone(), user.id, &format!("{name}-flow-it"));
-    app.handle_input(b"2");
-    wait_for_render_contains(&mut app, " Rooms ").await;
+    wait_for_render_contains(&mut app, "lounge").await;
     app.handle_input(b"i");
     wait_for_render_contains(&mut app, "Compose (Enter send").await;
     (test_db, app)
@@ -409,6 +462,7 @@ pub async fn chat_compose_app(name: &str) -> (TestDb, App) {
 
 pub async fn wait_for_render_contains(app: &mut App, needle: &str) {
     let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last_plain = String::new();
     while Instant::now() < deadline {
         app.tick();
         app.reset_render();
@@ -417,9 +471,10 @@ pub async fn wait_for_render_contains(app: &mut App, needle: &str) {
         if plain.contains(needle) {
             return;
         }
+        last_plain = plain;
         sleep(Duration::from_millis(30)).await;
     }
-    panic!("timed out waiting for render to contain {needle:?}");
+    panic!("timed out waiting for render to contain {needle:?}; last render:\n{last_plain}");
 }
 
 pub async fn assert_render_not_contains_for(app: &mut App, needle: &str, duration: Duration) {

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -9,25 +9,33 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::Context;
 use late_core::{
-    api_types::NowPlaying, db::Db, icecast, models::chat_room::ChatRoom, rate_limit::IpRateLimiter,
+    MutexRecover, db::Db, models::chat_room::ChatRoom, rate_limit::IpRateLimiter,
     shutdown::CancellationToken,
 };
 use late_ssh::{
     api,
-    app::ai::{ghost::GhostService, svc::AiService},
+    app::audio::now_playing::svc::NowPlayingService,
+    app::audio::svc::AudioService,
+    app::chat::feeds::svc::FeedService,
     app::chat::news::svc::ArticleService,
     app::chat::notifications::svc::NotificationService,
     app::chat::showcase::svc::ShowcaseService,
     app::chat::svc::ChatService,
+    app::chat::work::svc::WorkService,
     app::profile::svc::ProfileService,
     app::vote::svc::VoteService,
+    app::{
+        activity::channel::ACTIVITY_HISTORY_MAX_EVENTS,
+        ai::{ghost::GhostService, svc::AiService},
+    },
     config::Config,
+    moderation::service::ModerationInfra,
     session::SessionRegistry,
     ssh,
-    state::{ActivityEvent, State},
+    state::State,
 };
 use tokio::{
-    sync::{Semaphore, broadcast, watch},
+    sync::{Semaphore, broadcast},
     task::JoinSet,
 };
 
@@ -106,8 +114,13 @@ async fn main() -> anyhow::Result<()> {
     let conn_limit = Arc::new(Semaphore::new(config.max_conns_global));
     let conn_counts = Arc::new(Mutex::new(HashMap::new()));
     let active_users = Arc::new(Mutex::new(HashMap::new()));
-    let (activity_tx, _) = broadcast::channel::<ActivityEvent>(64);
-    let (now_playing_tx, now_playing_rx) = watch::channel::<Option<NowPlaying>>(None);
+    let activity_history = Arc::new(Mutex::new(VecDeque::new()));
+    let (activity_tx, mut activity_history_rx) = late_ssh::app::activity::channel::new(512);
+    let activity_publisher =
+        late_ssh::app::activity::publisher::ActivityPublisher::new(db.clone(), activity_tx.clone());
+    let now_playing_service = NowPlayingService::new(config.icecast_url.clone());
+    let now_playing_rx = now_playing_service.subscribe_state();
+    let audio_service = AudioService::new(db.clone(), config.youtube_api_key.clone());
     let session_registry = SessionRegistry::new();
     let vote_service = VoteService::new(
         db.clone(),
@@ -129,13 +142,18 @@ async fn main() -> anyhow::Result<()> {
         config.ai.api_key.clone(),
         config.ai.model.clone(),
     );
-    let profile_service = ProfileService::new(db.clone(), active_users.clone());
+    let profile_service = ProfileService::new(db.clone(), active_users.clone())
+        .with_session_registry(session_registry.clone());
     let article_service = ArticleService::new(db.clone(), ai_service.clone(), chat_service.clone());
+    let feed_service = FeedService::new(db.clone());
+    feed_service.start_poll_task();
     let showcase_service = ShowcaseService::new(db.clone());
+    let work_service = WorkService::new(db.clone());
     let twenty_forty_eight_service =
-        late_ssh::app::games::twenty_forty_eight::svc::TwentyFortyEightService::new(db.clone());
-    let tetris_service = late_ssh::app::games::tetris::svc::TetrisService::new(db.clone());
-    let chip_service = late_ssh::app::games::chips::svc::ChipService::new(db.clone());
+        late_ssh::app::arcade::twenty_forty_eight::svc::TwentyFortyEightService::new(db.clone());
+    let tetris_service = late_ssh::app::arcade::tetris::svc::TetrisService::new(db.clone());
+    let snake_service = late_ssh::app::arcade::snake::svc::SnakeService::new(db.clone());
+    let chip_service = late_ssh::app::arcade::chips::svc::ChipService::new(db.clone());
     let rooms_service = late_ssh::app::rooms::svc::RoomsService::new(db.clone());
     rooms_service.refresh_task();
     rooms_service.cleanup_inactive_tables_task();
@@ -143,23 +161,38 @@ async fn main() -> anyhow::Result<()> {
         late_ssh::app::rooms::blackjack::manager::BlackjackTableManager::new(
             chip_service.clone(),
             late_ssh::app::rooms::blackjack::player::BlackjackPlayerDirectory::new(db.clone()),
+            activity_publisher.clone(),
         );
-    let sudoku_service = late_ssh::app::games::sudoku::svc::SudokuService::new(
+    let tictactoe_table_manager =
+        late_ssh::app::rooms::tictactoe::manager::TicTacToeTableManager::new(
+            activity_publisher.clone(),
+        );
+    let poker_table_manager = late_ssh::app::rooms::poker::manager::PokerTableManager::new(
+        chip_service.clone(),
+        activity_publisher.clone(),
+    );
+    let room_game_registry = late_ssh::app::rooms::registry::RoomGameRegistry::new(
+        blackjack_table_manager.clone(),
+        poker_table_manager,
+        tictactoe_table_manager,
+    );
+    room_game_registry.start_general_seat_announcer_task(chat_service.clone());
+    let sudoku_service = late_ssh::app::arcade::sudoku::svc::SudokuService::new(
         db.clone(),
         activity_tx.clone(),
         chip_service.clone(),
     );
-    let nonogram_service = late_ssh::app::games::nonogram::svc::NonogramService::new(
+    let nonogram_service = late_ssh::app::arcade::nonogram::svc::NonogramService::new(
         db.clone(),
         activity_tx.clone(),
         chip_service.clone(),
     );
-    let solitaire_service = late_ssh::app::games::solitaire::svc::SolitaireService::new(
+    let solitaire_service = late_ssh::app::arcade::solitaire::svc::SolitaireService::new(
         db.clone(),
         activity_tx.clone(),
         chip_service.clone(),
     );
-    let minesweeper_service = late_ssh::app::games::minesweeper::svc::MinesweeperService::new(
+    let minesweeper_service = late_ssh::app::arcade::minesweeper::svc::MinesweeperService::new(
         db.clone(),
         activity_tx.clone(),
         chip_service.clone(),
@@ -183,13 +216,17 @@ async fn main() -> anyhow::Result<()> {
         initial_dartboard.map(|snapshot| snapshot.canvas),
         dartboard_provenance.clone(),
     );
-    let leaderboard_service =
-        late_ssh::app::games::leaderboard::svc::LeaderboardService::new(db.clone());
-    let nonogram_library = match late_ssh::app::games::nonogram::state::load_default_library() {
+    let chat_service = chat_service.with_moderation_infra(
+        ModerationInfra::default()
+            .with_force_admin(config.force_admin)
+            .with_artboard_handles(dartboard_server.clone(), dartboard_provenance.clone()),
+    );
+    let leaderboard_service = late_ssh::app::LeaderboardService::new(db.clone());
+    let nonogram_library = match late_ssh::app::arcade::nonogram::state::load_default_library() {
         Ok(library) => library,
         Err(err) => {
             tracing::warn!(error = ?err, "failed to load nonogram asset packs; continuing with empty library");
-            late_ssh::app::games::nonogram::state::Library::default()
+            late_ssh::app::arcade::nonogram::state::Library::default()
         }
     };
     let ghost_service = GhostService::new(
@@ -200,9 +237,8 @@ async fn main() -> anyhow::Result<()> {
         active_users.clone(),
         activity_tx.clone(),
     );
-    let paired_client_registry = late_ssh::session::PairedClientRegistry::new();
+    let paired_client_registry = late_ssh::paired_clients::PairedClientRegistry::new();
     let web_chat_registry = late_ssh::web::WebChatRegistry::new();
-    let icecast_url = config.icecast_url.clone();
     let ssh_attempt_limiter = IpRateLimiter::new(
         config.ssh_max_attempts_per_ip,
         config.ssh_rate_limit_window_secs,
@@ -217,14 +253,18 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         db: db.clone(),
         ai_service: ai_service.clone(),
+        audio_service: audio_service.clone(),
         vote_service: vote_service.clone(),
         chat_service: chat_service.clone(),
         notification_service: notification_service.clone(),
         article_service,
+        feed_service,
         showcase_service,
+        work_service,
         profile_service,
         twenty_forty_eight_service,
         tetris_service,
+        snake_service,
         sudoku_service,
         nonogram_service,
         solitaire_service,
@@ -234,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
         chip_service,
         rooms_service,
         blackjack_table_manager,
+        room_game_registry,
         dartboard_server,
         dartboard_provenance,
         leaderboard_service: leaderboard_service.clone(),
@@ -241,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
         conn_counts,
         active_users,
         activity_feed: activity_tx,
+        activity_history: activity_history.clone(),
         now_playing_rx: now_playing_rx.clone(),
         session_registry,
         paired_client_registry,
@@ -255,6 +297,30 @@ async fn main() -> anyhow::Result<()> {
     let singleton_shutdown = CancellationToken::new();
 
     let mut tasks = JoinSet::new();
+    let activity_history_shutdown = singleton_shutdown.clone();
+    tasks.spawn(async move {
+        loop {
+            tokio::select! {
+                _ = activity_history_shutdown.cancelled() => break,
+                result = activity_history_rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            let mut history = activity_history.lock_recover();
+                            history.push_back(event);
+                            while history.len() > ACTIVITY_HISTORY_MAX_EVENTS {
+                                history.pop_front();
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "activity history receiver lagged");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
     let api_state = state.clone();
     let api_shutdown = session_shutdown.clone();
     tasks.spawn(async move {
@@ -277,42 +343,21 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let now_playing_shutdown = session_shutdown.clone();
-    tasks.spawn_blocking(move || {
-        let mut last_title: Option<String> = None;
-        loop {
-            if now_playing_shutdown.is_cancelled() {
-                tracing::info!("now playing fetcher shutting down");
-                break;
-            }
-            let result = icecast::fetch_track(&icecast_url);
-            match result {
-                Ok(track) => {
-                    tracing::debug!(track = %track, "fetched now playing");
-                    // Only update if track changed (to reset started_at correctly)
-                    let current_title = track.to_string();
-                    if last_title.as_ref() != Some(&current_title) {
-                        tracing::info!(track = %track, "now playing changed");
-                        last_title = Some(current_title);
-                        let now_playing = NowPlaying::new(track);
-                        if let Err(err) = now_playing_tx.send(Some(now_playing)) {
-                            tracing::error!(error = ?err, "failed to publish now playing update");
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = ?e, "failed to fetch now playing, retrying in 5s");
-                }
-            }
+    let now_playing_task = now_playing_service.start_poll_task(now_playing_shutdown);
+    tasks.spawn(async move {
+        now_playing_task
+            .await
+            .context("now playing task panicked")?;
+        Ok(())
+    });
 
-            for _ in 0..10 {
-                if now_playing_shutdown.is_cancelled() {
-                    tracing::info!("now playing fetcher shutting down");
-                    return Ok(());
-                }
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-        }
+    // Audio rides session_shutdown (fires after ssh drain) rather than
+    // singleton_shutdown (fires at drain begin) so paired browsers keep
+    // hearing music through the entire drain window. Liquidsoap/Icecast
+    // streams from a separate process and is unaffected either way.
+    let audio_shutdown = session_shutdown.clone();
+    tasks.spawn(async move {
+        audio_service.start_background_task(audio_shutdown).await;
         Ok(())
     });
 
@@ -362,24 +407,6 @@ async fn main() -> anyhow::Result<()> {
             .await;
         Ok(())
     });
-
-    // Server-side audio analyzer (disabled - using browser-side viz only)
-    // To re-enable: add viz_tx to State, subscribe in ssh.rs, uncomment below
-    // let (viz_tx, _) = tokio::sync::broadcast::channel::<VizFrame>(32);
-    // let analyzer_tx = viz_tx.clone();
-    // tokio::task::spawn_blocking(move || {
-    //     let decoder = match SymphoniaStreamDecoder::new_http(&icecast_url) {
-    //         Ok(d) => d,
-    //         Err(e) => {
-    //             tracing::error!(error = ?e, "failed to create decoder");
-    //             return;
-    //         }
-    //     };
-    //     let sample_rate = decoder.sample_rate as f32;
-    //     if let Err(e) = run_analyzer(AnalyzerConfig::default(), analyzer_tx, decoder, sample_rate) {
-    //         tracing::error!(error = ?e, "audio analyzer failed");
-    //     }
-    // });
 
     tracing::info!("starting late.sh ssh server");
     let mut fatal_error = None;

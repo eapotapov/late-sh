@@ -1,25 +1,31 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
+use dartboard_core::Canvas;
 use late_core::{
     db::Db,
     models::{
-        artboard_ban::ArtboardBan,
+        artboard::Snapshot as ArtboardSnapshot,
+        artboard_ban::{ArtboardBan, ArtboardBanListItem},
         chat_room::ChatRoom,
         chat_room_member::ChatRoomMember,
-        moderation_audit_log::ModerationAuditLog,
-        room_ban::RoomBan,
-        server_ban::{ServerBan, ServerBanActivation},
-        user::User,
+        game_room::GameRoom,
+        moderation_audit_log::{ModerationAuditLog, ModerationAuditLogListItem},
+        room_ban::{RoomBan, RoomBanListItem},
+        server_ban::{ServerBan, ServerBanActivation, ServerBanListItem},
+        user::{User, sanitize_username_input},
     },
 };
 use serde_json::json;
 use tokio::sync::broadcast;
+use tokio_postgres::error::SqlState;
 use uuid::Uuid;
 
+use crate::app::artboard::provenance::{ArtboardProvenance, SharedArtboardProvenance};
 use crate::authz::{Caps, Permissions, Tier};
+use crate::dartboard;
 use crate::moderation::command::{
-    ArtboardAction, ModCommand, RoleAction, RoomModAction, ServerUserAction, mod_help_lines,
-    normalize_mod_slug, parse_mod_command, strip_user_prefix,
+    ArtboardAction, BanListScope, ModCommand, RoleAction, RoomModAction, ServerUserAction,
+    mod_help_lines, normalize_mod_slug, parse_mod_command, strip_user_prefix,
 };
 use crate::moderation::event::ModerationEvent;
 use crate::moderation::session_effects::ModerationSessionEffects;
@@ -29,7 +35,19 @@ pub(crate) struct ModerationService {
     db: Db,
     effects: ModerationSessionEffects,
     event_tx: broadcast::Sender<ModerationEvent>,
+    infra: ModerationInfra,
+}
+
+#[derive(Clone, Default)]
+pub struct ModerationInfra {
     force_admin: bool,
+    artboard: Option<ArtboardRestoreHandles>,
+}
+
+#[derive(Clone)]
+struct ArtboardRestoreHandles {
+    server: dartboard_local::ServerHandle,
+    provenance: SharedArtboardProvenance,
 }
 
 struct RoomModRequest {
@@ -45,16 +63,46 @@ impl ModerationService {
         db: Db,
         effects: ModerationSessionEffects,
         event_tx: broadcast::Sender<ModerationEvent>,
-        force_admin: bool,
+        infra: ModerationInfra,
     ) -> Self {
         Self {
             db,
             effects,
             event_tx,
-            force_admin,
+            infra,
         }
     }
+}
 
+impl ModerationInfra {
+    pub fn with_force_admin(mut self, force_admin: bool) -> Self {
+        self.force_admin = force_admin;
+        self
+    }
+
+    pub fn with_artboard_handles(
+        mut self,
+        server: dartboard_local::ServerHandle,
+        provenance: SharedArtboardProvenance,
+    ) -> Self {
+        self.artboard = Some(ArtboardRestoreHandles { server, provenance });
+        self
+    }
+
+    fn force_admin(&self) -> bool {
+        self.force_admin
+    }
+
+    fn artboard_handles(
+        &self,
+    ) -> Option<(&dartboard_local::ServerHandle, &SharedArtboardProvenance)> {
+        self.artboard
+            .as_ref()
+            .map(|handles| (&handles.server, &handles.provenance))
+    }
+}
+
+impl ModerationService {
     pub(crate) async fn run_command(
         &self,
         actor_user_id: Uuid,
@@ -65,6 +113,19 @@ impl ModerationService {
         match command {
             ModCommand::Help { topic } => Ok(mod_help_lines(topic.as_deref())),
             ModCommand::User { username } => self.user_detail(permissions, &username).await,
+            ModCommand::Bans { scope, limit } => self.list_bans(permissions, scope, limit).await,
+            ModCommand::Audit { limit } => self.list_audit(permissions, limit).await,
+            ModCommand::RenameRoom { slug, new_slug } => {
+                self.rename_room(actor_user_id, permissions, &slug, &new_slug)
+                    .await
+            }
+            ModCommand::RenameUser {
+                username,
+                new_username,
+            } => {
+                self.rename_user(actor_user_id, permissions, &username, &new_username)
+                    .await
+            }
             ModCommand::RoomAction {
                 action,
                 slug,
@@ -117,6 +178,10 @@ impl ModerationService {
                 )
                 .await
             }
+            ModCommand::ArtboardRestore { date, reason } => {
+                self.artboard_restore(actor_user_id, permissions, date, reason)
+                    .await
+            }
             ModCommand::Role { action, username } => {
                 self.role(actor_user_id, permissions, action, &username)
                     .await
@@ -140,6 +205,203 @@ impl ModerationService {
             format!("server_banned: {}", server_ban.is_some()),
             format!("artboard_banned: {}", artboard_ban.is_some()),
         ])
+    }
+
+    async fn list_bans(
+        &self,
+        permissions: Permissions,
+        scope: BanListScope,
+        limit: i64,
+    ) -> Result<Vec<String>> {
+        ensure_mod_surface(permissions)?;
+        let client = self.db.get().await?;
+        match scope {
+            BanListScope::All => {
+                let server = ServerBan::active_with_usernames(&client, limit).await?;
+                let artboard = ArtboardBan::active_with_usernames(&client, limit).await?;
+                let room = RoomBan::active_with_usernames(&client, limit).await?;
+                if server.is_empty() && artboard.is_empty() && room.is_empty() {
+                    return Ok(vec!["no active bans".to_string()]);
+                }
+                let mut lines = vec![format!("active bans (limit {limit} per section)")];
+                append_section(
+                    &mut lines,
+                    "server bans",
+                    server
+                        .iter()
+                        .map(format_server_ban_item)
+                        .collect::<Vec<_>>(),
+                );
+                append_section(
+                    &mut lines,
+                    "artboard bans",
+                    artboard
+                        .iter()
+                        .map(format_artboard_ban_item)
+                        .collect::<Vec<_>>(),
+                );
+                append_section(
+                    &mut lines,
+                    "room bans",
+                    room.iter().map(format_room_ban_item).collect::<Vec<_>>(),
+                );
+                Ok(lines)
+            }
+            BanListScope::Server => {
+                let items = ServerBan::active_with_usernames(&client, limit).await?;
+                Ok(single_section(
+                    "active server bans",
+                    "no active server bans",
+                    items.iter().map(format_server_ban_item).collect(),
+                ))
+            }
+            BanListScope::Artboard => {
+                let items = ArtboardBan::active_with_usernames(&client, limit).await?;
+                Ok(single_section(
+                    "active artboard bans",
+                    "no active artboard bans",
+                    items.iter().map(format_artboard_ban_item).collect(),
+                ))
+            }
+            BanListScope::Room { slug } => {
+                let room = find_room_by_mod_slug(&client, &slug).await?;
+                let room_slug = room.slug.clone().unwrap_or_else(|| room.kind.clone());
+                let items =
+                    RoomBan::active_for_room_with_usernames(&client, room.id, limit).await?;
+                Ok(single_section(
+                    &format!("active room bans for #{room_slug}"),
+                    &format!("no active room bans for #{room_slug}"),
+                    items.iter().map(format_room_ban_item).collect(),
+                ))
+            }
+        }
+    }
+
+    async fn list_audit(&self, permissions: Permissions, limit: i64) -> Result<Vec<String>> {
+        ensure_has(permissions, Caps::VIEW_STAFF_INFO)?;
+        let client = self.db.get().await?;
+        let items = ModerationAuditLog::recent_with_usernames(&client, limit).await?;
+        if items.is_empty() {
+            return Ok(vec!["no audit log entries".to_string()]);
+        }
+        let mut lines = vec![format!("recent audit log entries (limit {limit})")];
+        lines.extend(items.iter().map(format_audit_log_item));
+        Ok(lines)
+    }
+
+    async fn rename_room(
+        &self,
+        actor_user_id: Uuid,
+        permissions: Permissions,
+        slug: &str,
+        new_slug: &str,
+    ) -> Result<Vec<String>> {
+        ensure_has(permissions, Caps::RENAME_ROOM)?;
+        let old_slug = normalize_mod_slug(slug)?;
+        let new_slug = normalize_mod_slug(new_slug)?;
+        if old_slug == "general" {
+            anyhow::bail!("cannot rename #general");
+        }
+        if new_slug == "general" {
+            anyhow::bail!("cannot rename room to reserved #general");
+        }
+
+        let mut client = self.db.get().await?;
+        let room = find_room_by_mod_slug(&client, &old_slug).await?;
+        let current_slug = room.slug.clone().unwrap_or_else(|| room.kind.clone());
+        if current_slug == new_slug {
+            return Ok(vec![format!("room already named #{new_slug}")]);
+        }
+
+        let tx = client.transaction().await?;
+        let updated = ChatRoom::rename_non_dm_slug(&tx, room.id, &new_slug).await?;
+        if updated == 0 {
+            anyhow::bail!("room not found: #{old_slug}");
+        }
+        if room.kind == "game" {
+            GameRoom::rename_by_chat_room_id(&tx, room.id, &new_slug).await?;
+        }
+        ModerationAuditLog::record_if(
+            &tx,
+            permissions.should_audit(false),
+            actor_user_id,
+            "rename_room",
+            "room",
+            Some(room.id),
+            json!({ "old_slug": current_slug, "new_slug": new_slug }),
+        )
+        .await?;
+        tx.commit().await?;
+        let _ = self.event_tx.send(ModerationEvent::RoomRenamed {
+            actor_user_id,
+            room_id: room.id,
+            old_slug: current_slug.clone(),
+            new_slug: new_slug.clone(),
+        });
+        Ok(vec![format!("renamed #{current_slug} to #{new_slug}")])
+    }
+
+    async fn rename_user(
+        &self,
+        actor_user_id: Uuid,
+        permissions: Permissions,
+        username: &str,
+        new_username: &str,
+    ) -> Result<Vec<String>> {
+        ensure_has(permissions, Caps::RENAME_USER)?;
+
+        let mut client = self.db.get().await?;
+        let target = find_user_by_mod_name(&client, username).await?;
+        ensure_can(permissions, Caps::RENAME_USER, tier_for_user(&target))?;
+        let old_username = target.username.clone();
+        let new_username = sanitize_username_input(new_username);
+        if old_username.eq_ignore_ascii_case(&new_username) {
+            return Ok(vec![format!("@{old_username} already has that username")]);
+        }
+        if User::find_by_username(&client, &new_username)
+            .await?
+            .is_some()
+        {
+            anyhow::bail!("username already taken: @{new_username}");
+        }
+
+        let tx = client.transaction().await?;
+        let updated = match User::rename(&tx, target.id, &new_username).await {
+            Ok(updated) => updated,
+            Err(error) if is_unique_violation(&error) => {
+                anyhow::bail!("username already taken: @{new_username}");
+            }
+            Err(error) => return Err(error),
+        };
+        ModerationAuditLog::record(
+            &tx,
+            actor_user_id,
+            "rename_user",
+            "user",
+            Some(target.id),
+            json!({
+                "old_username": old_username,
+                "new_username": updated.username,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+
+        let active_user_updated = self
+            .effects
+            .update_active_username(target.id, &updated.username);
+        let _ = self.event_tx.send(ModerationEvent::UserRenamed {
+            actor_user_id,
+            target_user_id: target.id,
+            old_username: old_username.clone(),
+            new_username: updated.username.clone(),
+            active_user_updated,
+        });
+
+        Ok(vec![format!(
+            "renamed @{old_username} to @{}",
+            updated.username
+        )])
     }
 
     async fn room_action(
@@ -406,6 +668,70 @@ impl ModerationService {
         )])
     }
 
+    async fn artboard_restore(
+        &self,
+        actor_user_id: Uuid,
+        permissions: Permissions,
+        date: Option<NaiveDate>,
+        reason: String,
+    ) -> Result<Vec<String>> {
+        ensure_has(permissions, Caps::RESTORE_ARTBOARD)?;
+        let (server, shared_provenance) = self
+            .infra
+            .artboard_handles()
+            .ok_or_else(|| anyhow::anyhow!("artboard restore is unavailable"))?;
+        let date = date.unwrap_or_else(previous_utc_day);
+        let source_key = daily_artboard_key(date);
+        let backup_key = format!(
+            "restore-backup:main:{}:{}",
+            Utc::now().format("%Y%m%dT%H%M%S%.fZ"),
+            Uuid::now_v7()
+        );
+
+        let mut client = self.db.get().await?;
+        let source = ArtboardSnapshot::find_by_board_key(&client, &source_key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("artboard snapshot not found: {source_key}"))?;
+        let canvas: Canvas = serde_json::from_value(source.canvas.clone())?;
+        let provenance: ArtboardProvenance = serde_json::from_value(source.provenance.clone())?;
+
+        let tx = client.transaction().await?;
+        let backed_up =
+            ArtboardSnapshot::copy_board_key(&tx, ArtboardSnapshot::MAIN_BOARD_KEY, &backup_key)
+                .await?
+                > 0;
+        ModerationAuditLog::record(
+            &tx,
+            actor_user_id,
+            "artboard_restore",
+            "artboard",
+            None,
+            json!({
+                "source_key": source_key.clone(),
+                "backup_key": backed_up.then_some(backup_key.clone()),
+                "reason": reason.clone(),
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+
+        dartboard::restore_live_artboard(&self.db, server, shared_provenance, canvas, provenance)
+            .await?;
+
+        let _ = self.event_tx.send(ModerationEvent::ArtboardRestored {
+            actor_user_id,
+            source_key: source_key.clone(),
+            backup_key: backed_up.then_some(backup_key.clone()),
+            reason,
+        });
+
+        let mut lines = vec![format!("restored artboard from {source_key}")];
+        if backed_up {
+            lines.push(format!("backup: {backup_key}"));
+        }
+        Ok(lines)
+    }
+
     async fn role(
         &self,
         actor_user_id: Uuid,
@@ -439,7 +765,10 @@ impl ModerationService {
         )
         .await?;
         tx.commit().await?;
-        let permissions = Permissions::new(target.is_admin || self.force_admin, new_is_moderator);
+        let permissions = Permissions::new(
+            target.is_admin || self.infra.force_admin(),
+            new_is_moderator,
+        );
         let notified_sessions = self
             .effects
             .notify_permissions_changed(target.id, permissions)
@@ -522,6 +851,163 @@ pub(crate) const fn cap_for_server_ban(duration: Option<chrono::Duration>) -> Ca
     } else {
         Caps::PERMA_BAN_USER
     }
+}
+
+fn single_section(title: &str, empty: &str, items: Vec<String>) -> Vec<String> {
+    if items.is_empty() {
+        vec![empty.to_string()]
+    } else {
+        let mut lines = vec![format!("{title}:")];
+        lines.extend(items);
+        lines
+    }
+}
+
+fn append_section(lines: &mut Vec<String>, title: &str, items: Vec<String>) {
+    lines.push(format!("{title}:"));
+    if items.is_empty() {
+        lines.push("- none".to_string());
+    } else {
+        lines.extend(items);
+    }
+}
+
+fn format_server_ban_item(item: &ServerBanListItem) -> String {
+    let target = item
+        .target_username
+        .as_deref()
+        .or(item.ban.snapshot_username.as_deref())
+        .map(user_label)
+        .unwrap_or_else(|| item.ban.target_user_id.to_string());
+    let actor = item
+        .actor_username
+        .as_deref()
+        .map(user_label)
+        .unwrap_or_else(|| item.ban.actor_user_id.to_string());
+    let ip = item
+        .ban
+        .ip_address
+        .as_deref()
+        .map(|ip| format!(" ip: {ip}"))
+        .unwrap_or_default();
+    format!(
+        "- {target} by {actor} expires: {}{} reason: {}",
+        format_expires_at(item.ban.expires_at),
+        ip,
+        format_reason(&item.ban.reason)
+    )
+}
+
+fn format_artboard_ban_item(item: &ArtboardBanListItem) -> String {
+    let target = item
+        .target_username
+        .as_deref()
+        .map(user_label)
+        .unwrap_or_else(|| item.ban.target_user_id.to_string());
+    let actor = item
+        .actor_username
+        .as_deref()
+        .map(user_label)
+        .unwrap_or_else(|| item.ban.actor_user_id.to_string());
+    format!(
+        "- {target} by {actor} expires: {} reason: {}",
+        format_expires_at(item.ban.expires_at),
+        format_reason(&item.ban.reason)
+    )
+}
+
+fn format_room_ban_item(item: &RoomBanListItem) -> String {
+    let room = item
+        .room_slug
+        .as_deref()
+        .map(|slug| format!("#{slug}"))
+        .unwrap_or_else(|| item.ban.room_id.to_string());
+    let target = item
+        .target_username
+        .as_deref()
+        .map(user_label)
+        .unwrap_or_else(|| item.ban.target_user_id.to_string());
+    let actor = item
+        .actor_username
+        .as_deref()
+        .map(user_label)
+        .unwrap_or_else(|| item.ban.actor_user_id.to_string());
+    format!(
+        "- {room} {target} by {actor} expires: {} reason: {}",
+        format_expires_at(item.ban.expires_at),
+        format_reason(&item.ban.reason)
+    )
+}
+
+fn format_audit_log_item(item: &ModerationAuditLogListItem) -> String {
+    let actor = item
+        .actor_username
+        .as_deref()
+        .map(user_label)
+        .unwrap_or_else(|| item.log.actor_user_id.to_string());
+    let target = if item.log.target_kind == "user" {
+        item.target_username
+            .as_deref()
+            .map(user_label)
+            .or_else(|| item.log.target_id.map(|id| id.to_string()))
+            .unwrap_or_else(|| "none".to_string())
+    } else {
+        item.log
+            .target_id
+            .map(|id| format!("{}:{id}", item.log.target_kind))
+            .unwrap_or_else(|| item.log.target_kind.clone())
+    };
+    let metadata = if item
+        .log
+        .metadata
+        .as_object()
+        .is_some_and(|map| map.is_empty())
+    {
+        String::new()
+    } else {
+        format!(" metadata: {}", item.log.metadata)
+    };
+    format!(
+        "- {} {actor} {} target: {target}{metadata}",
+        item.log.created.format("%Y-%m-%d %H:%M UTC"),
+        item.log.action
+    )
+}
+
+fn format_expires_at(expires_at: Option<chrono::DateTime<Utc>>) -> String {
+    expires_at
+        .map(|expires_at| expires_at.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "permanent".to_string())
+}
+
+fn format_reason(reason: &str) -> &str {
+    if reason.trim().is_empty() {
+        "-"
+    } else {
+        reason.trim()
+    }
+}
+
+fn user_label(username: &str) -> String {
+    format!("@{username}")
+}
+
+fn previous_utc_day() -> NaiveDate {
+    Utc::now()
+        .date_naive()
+        .pred_opt()
+        .expect("UTC date overflow")
+}
+
+fn daily_artboard_key(date: NaiveDate) -> String {
+    format!("daily:{date}")
+}
+
+fn is_unique_violation(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<tokio_postgres::Error>())
+        .any(|error| error.code() == Some(&SqlState::UNIQUE_VIOLATION))
 }
 
 async fn find_user_by_mod_name(client: &tokio_postgres::Client, username: &str) -> Result<User> {

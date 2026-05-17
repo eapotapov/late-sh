@@ -15,7 +15,7 @@ resource "kubernetes_secret_v1" "regcred" {
 }
 
 # =============================================================================
-# S3 Credentials (for CloudNativePG backups)
+# S3 Credentials (for CloudNativePG backups and public file uploads)
 # =============================================================================
 
 resource "kubernetes_secret_v1" "s3_credentials" {
@@ -61,6 +61,27 @@ resource "kubernetes_secret_v1" "ai_credentials" {
 
   data = {
     api_key = var.AI_API_KEY
+  }
+
+  type = "Opaque"
+}
+
+# =============================================================================
+# Web Terminal Tunnel Token
+# =============================================================================
+
+resource "random_password" "web_tunnel_token" {
+  length  = 32
+  special = false
+}
+
+resource "kubernetes_secret_v1" "web_tunnel_token" {
+  metadata {
+    name = "web-tunnel-token"
+  }
+
+  data = {
+    token = random_password.web_tunnel_token.result
   }
 
   type = "Opaque"

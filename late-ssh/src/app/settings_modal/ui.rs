@@ -48,7 +48,8 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &SettingsModalState) {
         Tab::Settings => draw_settings_tab(frame, layout[3], state),
         Tab::Themes => draw_themes_tab(frame, layout[3], state),
         Tab::Bio => draw_bio_tab(frame, layout[3], state),
-        Tab::Favorites => draw_favorites_tab(frame, layout[3], state),
+        Tab::Account => draw_account_tab(frame, layout[3], state),
+        Tab::Feeds => draw_feeds_tab(frame, layout[3], state),
         Tab::Special => draw_special_tab(frame, layout[3], state),
     }
 
@@ -56,6 +57,9 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &SettingsModalState) {
 
     if state.picker_open() {
         draw_picker(frame, popup, state);
+    }
+    if state.delete_account_dialog().open() {
+        draw_delete_account_dialog(frame, popup, state);
     }
 }
 
@@ -85,7 +89,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, tab: Tab, editing_bio: bool) {
             spans.extend([
                 Span::styled("Esc", Style::default().fg(theme::AMBER_DIM())),
                 Span::styled(" save & preview  ", Style::default().fg(theme::TEXT_DIM())),
-                Span::styled("Alt+Enter", Style::default().fg(theme::AMBER_DIM())),
+                Span::styled("Alt+Enter/Ctrl+J", Style::default().fg(theme::AMBER_DIM())),
                 Span::styled(" newline  ", Style::default().fg(theme::TEXT_DIM())),
                 Span::styled("Tab/S+Tab", Style::default().fg(theme::AMBER_DIM())),
                 Span::styled(
@@ -140,18 +144,26 @@ fn draw_footer(frame: &mut Frame, area: Rect, tab: Tab, editing_bio: bool) {
                 Span::styled(" close", Style::default().fg(theme::TEXT_DIM())),
             ]);
         }
-        (Tab::Favorites, _) => {
+        (Tab::Account, _) => {
+            spans.extend([
+                Span::styled("↵", Style::default().fg(theme::AMBER_DIM())),
+                Span::styled(" open confirm  ", Style::default().fg(theme::TEXT_DIM())),
+                Span::styled("Tab/S+Tab", Style::default().fg(theme::AMBER_DIM())),
+                Span::styled(" switch tabs  ", Style::default().fg(theme::TEXT_DIM())),
+                Span::styled("Esc/q", Style::default().fg(theme::AMBER_DIM())),
+                Span::styled(" close", Style::default().fg(theme::TEXT_DIM())),
+            ]);
+        }
+        (Tab::Feeds, _) => {
             spans.extend([
                 Span::styled("↑↓ j/k", Style::default().fg(theme::AMBER_DIM())),
                 Span::styled(" navigate  ", Style::default().fg(theme::TEXT_DIM())),
-                Span::styled("J/K", Style::default().fg(theme::AMBER_DIM())),
-                Span::styled(" reorder  ", Style::default().fg(theme::TEXT_DIM())),
+                Span::styled("↵/a", Style::default().fg(theme::AMBER_DIM())),
+                Span::styled(" add  ", Style::default().fg(theme::TEXT_DIM())),
                 Span::styled("d", Style::default().fg(theme::AMBER_DIM())),
                 Span::styled(" remove  ", Style::default().fg(theme::TEXT_DIM())),
-                Span::styled("↵", Style::default().fg(theme::AMBER_DIM())),
-                Span::styled(" add  ", Style::default().fg(theme::TEXT_DIM())),
-                Span::styled("Tab/S+Tab", Style::default().fg(theme::AMBER_DIM())),
-                Span::styled(" switch tabs  ", Style::default().fg(theme::TEXT_DIM())),
+                Span::styled("r", Style::default().fg(theme::AMBER_DIM())),
+                Span::styled(" refresh  ", Style::default().fg(theme::TEXT_DIM())),
                 Span::styled("Esc/q", Style::default().fg(theme::AMBER_DIM())),
                 Span::styled(" close", Style::default().fg(theme::TEXT_DIM())),
             ]);
@@ -356,10 +368,10 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, state: &SettingsModalState) 
         Constraint::Length(1), // Appearance heading
         Constraint::Length(1), // Theme
         Constraint::Length(1), // Background
-        Constraint::Length(1), // Stream + vote
-        Constraint::Length(1), // Room showcase
         Constraint::Length(1), // Right sidebar
-        Constraint::Length(1), // Games sidebar
+        Constraint::Length(1), // Room list
+        Constraint::Length(1), // Lounge boxes
+        Constraint::Length(1), // Wire box
         Constraint::Length(1), // breathing room
         Constraint::Length(1), // Location heading
         Constraint::Length(1), // Country
@@ -372,6 +384,8 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, state: &SettingsModalState) 
         Constraint::Length(1), // Bell
         Constraint::Length(1), // Cooldown
         Constraint::Length(1), // Format
+        Constraint::Length(1), // breathing room
+        Constraint::Length(1), // shortcuts hint
     ])
     .split(area);
 
@@ -387,9 +401,12 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, state: &SettingsModalState) 
             if state.editing_username() {
                 let typed = state.username_input().lines().join("");
                 if typed.is_empty() {
-                    value_span("typing…", theme::AMBER())
+                    value_span("█", theme::AMBER())
                 } else {
-                    value_span(format!("{}█", typed), theme::AMBER())
+                    value_span(
+                        text_with_caret(&typed, state.username_input().cursor().1),
+                        theme::AMBER(),
+                    )
                 }
             } else if state.draft().username.is_empty() {
                 value_span("not set", theme::TEXT_FAINT())
@@ -478,44 +495,43 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, state: &SettingsModalState) 
     frame.render_widget(
         Paragraph::new(row_line(
             state,
-            Row::DashboardHeader,
+            Row::RightSidebar,
             width,
-            "Stream + vote",
-            toggle_span(state.draft().show_dashboard_header),
+            "Right sidebar",
+            toggle_span(state.draft().show_right_sidebar),
         )),
         sections[10],
     );
     frame.render_widget(
         Paragraph::new(row_line(
             state,
-            Row::DashboardRoomShowcases,
+            Row::RoomListSidebar,
             width,
-            "Room showcase",
-            toggle_span(state.draft().show_dashboard_room_showcases),
+            "Room list",
+            toggle_span(state.draft().show_room_list_sidebar),
         )),
         sections[11],
     );
     frame.render_widget(
         Paragraph::new(row_line(
             state,
-            Row::RightSidebar,
+            Row::LoungeInfo,
             width,
-            "Right sidebar",
-            toggle_span(state.draft().show_right_sidebar),
+            "Lounge boxes",
+            toggle_span(state.draft().show_dashboard_header),
         )),
         sections[12],
     );
     frame.render_widget(
         Paragraph::new(row_line(
             state,
-            Row::GamesSidebar,
+            Row::WireBox,
             width,
-            "Games sidebar",
-            toggle_span(state.draft().show_games_sidebar),
+            "Wire box",
+            toggle_span(state.draft().show_dashboard_wire),
         )),
         sections[13],
     );
-
     frame.render_widget(Paragraph::new(section_heading("Location")), sections[15]);
     frame.render_widget(
         Paragraph::new(row_line(
@@ -618,6 +634,43 @@ fn draw_settings_tab(frame: &mut Frame, area: Rect, state: &SettingsModalState) 
         )),
         sections[25],
     );
+
+    frame.render_widget(Paragraph::new(shortcuts_hint_line(width)), sections[27]);
+}
+
+fn shortcuts_hint_line(width: usize) -> Line<'static> {
+    let bg = theme::BG_HIGHLIGHT();
+    let key_style = Style::default()
+        .fg(theme::AMBER_GLOW())
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(theme::TEXT_BRIGHT()).bg(bg);
+    let bg_style = Style::default().bg(bg);
+
+    let leading = "   ";
+    let key1 = "?";
+    let text1 = "  app tour";
+    let separator = "      ";
+    let key2 = "Ctrl+O";
+    let text2 = "  reopen settings anywhere";
+
+    let used = leading.chars().count()
+        + key1.chars().count()
+        + text1.chars().count()
+        + separator.chars().count()
+        + key2.chars().count()
+        + text2.chars().count();
+    let trailing = " ".repeat(width.saturating_sub(used));
+
+    Line::from(vec![
+        Span::styled(leading, bg_style),
+        Span::styled(key1, key_style),
+        Span::styled(text1, text_style),
+        Span::styled(separator, bg_style),
+        Span::styled(key2, key_style),
+        Span::styled(text2, text_style),
+        Span::styled(trailing, bg_style),
+    ])
 }
 
 fn draw_special_tab(frame: &mut Frame, area: Rect, state: &SettingsModalState) {
@@ -701,6 +754,231 @@ fn draw_special_tab(frame: &mut Frame, area: Rect, state: &SettingsModalState) {
     } else {
         state.gem().hit_area.set(None);
     }
+}
+
+fn draw_account_tab(frame: &mut Frame, area: Rect, _state: &SettingsModalState) {
+    let sections = Layout::vertical([
+        Constraint::Length(1), // heading
+        Constraint::Length(1), // breathing
+        Constraint::Length(1), // button
+        Constraint::Length(1), // description
+        Constraint::Min(0),
+    ])
+    .split(area);
+
+    frame.render_widget(Paragraph::new(section_heading("Account")), sections[0]);
+
+    let width = area.width as usize;
+    let label = "Delete Account";
+    let prefix = " › ";
+    let used = prefix.chars().count() + label.chars().count();
+    let trailing = " ".repeat(width.saturating_sub(used));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                prefix,
+                Style::default()
+                    .fg(theme::ERROR())
+                    .bg(theme::BG_SELECTION())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(theme::ERROR())
+                    .bg(theme::BG_SELECTION())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(trailing, Style::default().bg(theme::BG_SELECTION())),
+        ])),
+        sections[2],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(
+                "Delete your own account (cannot be undone!)",
+                Style::default().fg(theme::TEXT_DIM()),
+            ),
+        ])),
+        sections[3],
+    );
+}
+
+fn draw_feeds_tab(frame: &mut Frame, area: Rect, state: &SettingsModalState) {
+    let sections = Layout::vertical([
+        Constraint::Length(1), // heading
+        Constraint::Length(1), // hint
+        Constraint::Length(1), // breathing
+        Constraint::Min(4),    // list
+    ])
+    .split(area);
+
+    frame.render_widget(Paragraph::new(section_heading("RSS")), sections[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "RSS/Atom entries stay private until you share them from Chat > rss.",
+                Style::default().fg(theme::TEXT_DIM()),
+            ),
+        ])),
+        sections[1],
+    );
+
+    let width = sections[3].width as usize;
+    let mut lines = Vec::new();
+    for (idx, feed) in state.feeds().iter().enumerate() {
+        lines.push(feed_row_line(
+            idx == state.feed_index() && !state.editing_feed_url(),
+            width,
+            feed_display_title(feed),
+            feed.url.as_str(),
+            feed.last_error.as_deref(),
+        ));
+    }
+    lines.push(feed_add_line(
+        state.feed_index_is_add_row() && !state.editing_feed_url(),
+        state.editing_feed_url(),
+        width,
+        state,
+    ));
+
+    frame.render_widget(Paragraph::new(lines), sections[3]);
+}
+
+fn feed_display_title(feed: &late_core::models::rss_feed::RssFeed) -> String {
+    let title = feed.title.trim();
+    if title.is_empty() {
+        "untitled RSS".to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+fn feed_row_line(
+    selected: bool,
+    width: usize,
+    title: String,
+    url: &str,
+    error: Option<&str>,
+) -> Line<'static> {
+    let marker = if selected { "›" } else { " " };
+    let prefix_style = if selected {
+        Style::default()
+            .fg(theme::AMBER_GLOW())
+            .bg(theme::BG_SELECTION())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::TEXT_FAINT())
+    };
+    let title_style = if selected {
+        Style::default()
+            .fg(theme::TEXT_BRIGHT())
+            .bg(theme::BG_SELECTION())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::TEXT_BRIGHT())
+    };
+    let url_style = if selected {
+        Style::default()
+            .fg(theme::TEXT_DIM())
+            .bg(theme::BG_SELECTION())
+    } else {
+        Style::default().fg(theme::TEXT_FAINT())
+    };
+    let error_style = if selected {
+        Style::default()
+            .fg(theme::ERROR())
+            .bg(theme::BG_SELECTION())
+    } else {
+        Style::default().fg(theme::ERROR())
+    };
+    let trailing_style = if selected {
+        Style::default().bg(theme::BG_SELECTION())
+    } else {
+        Style::default()
+    };
+
+    let prefix = format!(" {marker} ");
+    let title_text = format!("{title:<28}  ");
+    let status_text = error
+        .map(|err| format!("  error: {err}"))
+        .unwrap_or_default();
+    let used = prefix.chars().count()
+        + title_text.chars().count()
+        + url.chars().count()
+        + status_text.chars().count();
+    let padding = width.saturating_sub(used.min(width));
+
+    Line::from(vec![
+        Span::styled(prefix, prefix_style),
+        Span::styled(title_text, title_style),
+        Span::styled(url.to_string(), url_style),
+        Span::styled(status_text, error_style),
+        Span::styled(" ".repeat(padding), trailing_style),
+    ])
+}
+
+fn feed_add_line(
+    selected: bool,
+    editing: bool,
+    width: usize,
+    state: &SettingsModalState,
+) -> Line<'static> {
+    let active = selected || editing;
+    let marker = if active { "›" } else { " " };
+    let prefix_style = if active {
+        Style::default()
+            .fg(theme::AMBER_GLOW())
+            .bg(theme::BG_SELECTION())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::TEXT_FAINT())
+    };
+    let trailing_style = if active {
+        Style::default().bg(theme::BG_SELECTION())
+    } else {
+        Style::default()
+    };
+
+    let prefix = format!(" {marker} ");
+    let (text, text_style) = if editing {
+        let typed = state.feed_url_input().lines().join("");
+        let display = if typed.is_empty() {
+            "█".to_string()
+        } else {
+            text_with_caret(&typed, state.feed_url_input().cursor().1)
+        };
+        (
+            display,
+            Style::default()
+                .fg(theme::AMBER())
+                .bg(theme::BG_SELECTION()),
+        )
+    } else if active {
+        (
+            "+ Add RSS…".to_string(),
+            Style::default()
+                .fg(theme::AMBER_GLOW())
+                .bg(theme::BG_SELECTION())
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        (
+            "+ Add RSS…".to_string(),
+            Style::default().fg(theme::AMBER_DIM()),
+        )
+    };
+
+    let used = prefix.chars().count() + text.chars().count();
+    let padding = width.saturating_sub(used.min(width));
+
+    Line::from(vec![
+        Span::styled(prefix, prefix_style),
+        Span::styled(text, text_style),
+        Span::styled(" ".repeat(padding), trailing_style),
+    ])
 }
 
 /// Layout note: `area` is the 6-line strip reserved at the bottom of the
@@ -976,126 +1254,6 @@ fn draw_bio_tab(frame: &mut Frame, area: Rect, state: &SettingsModalState) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), padded);
 }
 
-fn draw_favorites_tab(frame: &mut Frame, area: Rect, state: &SettingsModalState) {
-    let sections = Layout::vertical([
-        Constraint::Length(1), // heading
-        Constraint::Length(1), // hint
-        Constraint::Length(1), // breathing
-        Constraint::Min(4),    // body
-    ])
-    .split(area);
-
-    frame.render_widget(
-        Paragraph::new(section_heading("Favorite rooms")),
-        sections[0],
-    );
-
-    let hint = Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            "Pin rooms to the dashboard quick-switch strip ([ / ]).",
-            Style::default().fg(theme::TEXT_DIM()),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(hint), sections[1]);
-
-    let body_width = sections[3].width as usize;
-    let favorites = state.favorites();
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(favorites.len() + 1);
-
-    for (idx, room_id) in favorites.iter().enumerate() {
-        let selected = state.favorites_index() == idx;
-        let label_text = state
-            .room_label(*room_id)
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "(unknown room)".to_string());
-        let position_text = format!("{:>2}. ", idx + 1);
-        let label_style = if selected {
-            Style::default()
-                .fg(theme::TEXT_BRIGHT())
-                .bg(theme::BG_SELECTION())
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::TEXT_BRIGHT())
-        };
-        let position_style = if selected {
-            Style::default()
-                .fg(theme::AMBER_GLOW())
-                .bg(theme::BG_SELECTION())
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::TEXT_FAINT())
-        };
-        let marker = if selected { "›" } else { " " };
-        let prefix_style = if selected {
-            Style::default()
-                .fg(theme::AMBER_GLOW())
-                .bg(theme::BG_SELECTION())
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::TEXT_FAINT())
-        };
-        let prefix = format!(" {marker} ");
-        let used =
-            prefix.chars().count() + position_text.chars().count() + label_text.chars().count();
-        let padding = body_width.saturating_sub(used);
-        let trailing = " ".repeat(padding);
-        let trailing_style = if selected {
-            Style::default().bg(theme::BG_SELECTION())
-        } else {
-            Style::default()
-        };
-
-        lines.push(Line::from(vec![
-            Span::styled(prefix, prefix_style),
-            Span::styled(position_text, position_style),
-            Span::styled(label_text, label_style),
-            Span::styled(trailing, trailing_style),
-        ]));
-    }
-
-    // Trailing "Add favorite…" row. Highlighted like a favorite row when
-    // selected so the visual language is consistent.
-    let add_selected = state.favorites_index_is_add_row();
-    let add_text = if state.available_rooms().len() == favorites.len() {
-        "(no more rooms to add — join one in chat first)"
-    } else {
-        "+ Add favorite room…"
-    };
-    let add_style = if add_selected {
-        Style::default()
-            .fg(theme::AMBER_GLOW())
-            .bg(theme::BG_SELECTION())
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme::AMBER_DIM())
-    };
-    let marker = if add_selected { "›" } else { " " };
-    let prefix_style = if add_selected {
-        Style::default()
-            .fg(theme::AMBER_GLOW())
-            .bg(theme::BG_SELECTION())
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme::TEXT_FAINT())
-    };
-    let prefix = format!(" {marker} ");
-    let used = prefix.chars().count() + add_text.chars().count();
-    let padding = body_width.saturating_sub(used);
-    let trailing_style = if add_selected {
-        Style::default().bg(theme::BG_SELECTION())
-    } else {
-        Style::default()
-    };
-    lines.push(Line::from(vec![
-        Span::styled(prefix, prefix_style),
-        Span::styled(add_text.to_string(), add_style),
-        Span::styled(" ".repeat(padding), trailing_style),
-    ]));
-
-    frame.render_widget(Paragraph::new(lines), sections[3]);
-}
-
 fn draw_picker(frame: &mut Frame, area: Rect, state: &SettingsModalState) {
     let popup = centered_rect(54, 20, area);
     frame.render_widget(Clear, popup);
@@ -1103,7 +1261,6 @@ fn draw_picker(frame: &mut Frame, area: Rect, state: &SettingsModalState) {
     let title = match state.picker().kind {
         Some(PickerKind::Country) => " Pick Country ",
         Some(PickerKind::Timezone) => " Pick Timezone ",
-        Some(PickerKind::Room) => " Pick Room ",
         None => " Picker ",
     };
     let block = Block::default()
@@ -1152,11 +1309,6 @@ fn draw_picker(frame: &mut Frame, area: Rect, state: &SettingsModalState) {
             .into_iter()
             .map(ToString::to_string)
             .collect(),
-        Some(PickerKind::Room) => state
-            .filtered_rooms()
-            .into_iter()
-            .map(|room| room.label.clone())
-            .collect(),
         None => Vec::new(),
     };
 
@@ -1204,6 +1356,115 @@ fn draw_picker(frame: &mut Frame, area: Rect, state: &SettingsModalState) {
     frame.render_widget(Paragraph::new(footer), layout[3]);
 }
 
+fn draw_delete_account_dialog(frame: &mut Frame, area: Rect, state: &SettingsModalState) {
+    let popup = centered_rect(64, 12, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Delete Account ")
+        .title_style(
+            Style::default()
+                .fg(theme::ERROR())
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ERROR()));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let layout = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "This cannot be undone.",
+                Style::default()
+                    .fg(theme::ERROR())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        layout[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                "Type your username to confirm:",
+                Style::default().fg(theme::TEXT_DIM()),
+            ),
+        ])),
+        layout[2],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(
+                state.draft().username.clone(),
+                Style::default()
+                    .fg(theme::TEXT_BRIGHT())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        layout[3],
+    );
+
+    let typed = state.delete_account_dialog().input().lines().join("");
+    let input_text = if typed.is_empty() {
+        "username".to_string()
+    } else if state.delete_account_dialog().pending() {
+        typed.clone()
+    } else {
+        format!("{typed}█")
+    };
+    let input_style = if typed.is_empty() {
+        Style::default().fg(theme::TEXT_FAINT())
+    } else {
+        Style::default().fg(theme::AMBER())
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" › ", Style::default().fg(theme::AMBER_GLOW())),
+            Span::styled(input_text, input_style),
+        ])),
+        layout[4],
+    );
+
+    if let Some(status) = state.delete_account_dialog().status() {
+        let color = if state.delete_account_dialog().pending() {
+            theme::AMBER()
+        } else {
+            theme::ERROR()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(status.to_string(), Style::default().fg(color)),
+            ])),
+            layout[5],
+        );
+    }
+
+    let footer = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("Enter", Style::default().fg(theme::AMBER_DIM())),
+        Span::styled(" delete  ", Style::default().fg(theme::TEXT_DIM())),
+        Span::styled("Esc", Style::default().fg(theme::AMBER_DIM())),
+        Span::styled(" cancel", Style::default().fg(theme::TEXT_DIM())),
+    ]);
+    frame.render_widget(Paragraph::new(footer), layout[7]);
+}
+
 fn section_heading(title: &str) -> Line<'static> {
     let dim = Style::default().fg(theme::BORDER());
     let accent = Style::default()
@@ -1228,17 +1489,22 @@ fn value_span(text: impl Into<String>, color: ratatui::style::Color) -> ValueSpa
     }
 }
 
+fn text_with_caret(text: &str, cursor_col: usize) -> String {
+    let mut chars: Vec<char> = text.chars().collect();
+    chars.insert(cursor_col.min(chars.len()), '█');
+    chars.into_iter().collect()
+}
+
 fn system_field_value(state: &SettingsModalState, row: Row, value: Option<String>) -> ValueSpan {
     if state.editing_system_row(row) {
         let typed = state.system_input().lines().join("");
         if typed.is_empty() {
-            if row == Row::Langs {
-                value_span("rust, go, typescript…", theme::AMBER())
-            } else {
-                value_span("typing…", theme::AMBER())
-            }
+            value_span("█", theme::AMBER())
         } else {
-            value_span(format!("{}█", typed), theme::AMBER())
+            value_span(
+                text_with_caret(&typed, state.system_input().cursor().1),
+                theme::AMBER(),
+            )
         }
     } else {
         match value
@@ -1363,4 +1629,17 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         .flex(Flex::Center)
         .split(vertical[0]);
     horizontal[0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_with_caret_uses_cursor_column() {
+        assert_eq!(text_with_caret("abcd", 0), "█abcd");
+        assert_eq!(text_with_caret("abcd", 2), "ab█cd");
+        assert_eq!(text_with_caret("abcd", 4), "abcd█");
+        assert_eq!(text_with_caret("abcd", 99), "abcd█");
+    }
 }

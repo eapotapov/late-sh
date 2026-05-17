@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
@@ -8,9 +9,9 @@ use std::{
 };
 use tokio::{sync::broadcast, time::interval};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use super::audio::VizSample;
+use super::{audio::VizSample, clipboard};
 
 pub(super) struct PairClientInfo {
     pub(super) ssh_mode: &'static str,
@@ -30,7 +31,15 @@ enum PairControlMessage {
     ToggleMute,
     VolumeUp,
     VolumeDown,
+    RequestClipboardImage,
+    ForceMute { mute: bool },
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+const CLIENT_CAPABILITIES: &[&str] = &["clipboard_image"];
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+const CLIENT_CAPABILITIES: &[&str] = &[];
 
 pub(super) async fn run_viz_ws(
     api_base_url: &str,
@@ -79,10 +88,17 @@ pub(super) async fn run_viz_ws(
                     break;
                 };
                 match msg? {
-                    Message::Text(text)
-                        if apply_pair_control(&text, playback.muted, playback.volume_percent)? =>
-                    {
-                        send_client_state(&mut ws, client, playback).await?;
+                    Message::Text(text) => {
+                        let should_send_state = handle_pair_control(
+                            &text,
+                            &mut ws,
+                            playback.muted,
+                            playback.volume_percent,
+                        )
+                        .await?;
+                        if should_send_state {
+                            send_client_state(&mut ws, client, playback).await?;
+                        }
                     }
                     Message::Close(_) => break,
                     _ => {}
@@ -106,6 +122,7 @@ async fn send_client_state(
         "client_kind": "cli",
         "ssh_mode": client.ssh_mode,
         "platform": client.platform,
+        "capabilities": CLIENT_CAPABILITIES,
         "muted": playback.muted.load(Ordering::Relaxed),
         "volume_percent": playback.volume_percent.load(Ordering::Relaxed),
     });
@@ -113,24 +130,88 @@ async fn send_client_state(
     Ok(())
 }
 
-fn apply_pair_control(text: &str, muted: &AtomicBool, volume_percent: &AtomicU8) -> Result<bool> {
-    match serde_json::from_str::<PairControlMessage>(text)? {
+async fn handle_pair_control(
+    text: &str,
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    muted: &AtomicBool,
+    volume_percent: &AtomicU8,
+) -> Result<bool> {
+    let control = match serde_json::from_str::<PairControlMessage>(text) {
+        Ok(control) => control,
+        Err(_) => {
+            warn!(payload = %text, "ignoring unsupported pair websocket event");
+            return Ok(false);
+        }
+    };
+    match control {
+        audio_control @ (PairControlMessage::ToggleMute
+        | PairControlMessage::VolumeUp
+        | PairControlMessage::VolumeDown) => {
+            apply_audio_pair_control(audio_control, muted, volume_percent);
+            Ok(true)
+        }
+        PairControlMessage::ForceMute { mute } => {
+            apply_force_mute(muted, mute);
+            Ok(true)
+        }
+        PairControlMessage::RequestClipboardImage => {
+            send_clipboard_image(ws).await?;
+            Ok(false)
+        }
+    }
+}
+
+fn apply_force_mute(muted: &AtomicBool, mute: bool) {
+    let previous = muted.swap(mute, Ordering::Relaxed);
+    if previous != mute {
+        info!(muted = mute, "applied server-forced mute");
+    }
+}
+
+fn apply_audio_pair_control(
+    control: PairControlMessage,
+    muted: &AtomicBool,
+    volume_percent: &AtomicU8,
+) {
+    match control {
         PairControlMessage::ToggleMute => {
             let now_muted = muted.fetch_xor(true, Ordering::Relaxed) ^ true;
             info!(muted = now_muted, "applied paired mute toggle");
-            Ok(true)
         }
         PairControlMessage::VolumeUp => {
             let new_volume = bump_volume(volume_percent, 5);
             info!(volume_percent = new_volume, "applied paired volume up");
-            Ok(true)
         }
         PairControlMessage::VolumeDown => {
             let new_volume = bump_volume(volume_percent, -5);
             info!(volume_percent = new_volume, "applied paired volume down");
-            Ok(true)
         }
+        PairControlMessage::ForceMute { .. } | PairControlMessage::RequestClipboardImage => {}
     }
+}
+
+async fn send_clipboard_image(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Result<()> {
+    let image_result = tokio::task::spawn_blocking(clipboard::image_png_bytes)
+        .await
+        .map_err(|err| anyhow::anyhow!("clipboard image task failed: {err}"))?;
+    let payload = match image_result {
+        Ok(bytes) => json!({
+            "event": "clipboard_image",
+            "data_base64": STANDARD.encode(bytes),
+        }),
+        Err(err) => json!({
+            "event": "clipboard_image_failed",
+            "message": err.to_string(),
+        }),
+    };
+    ws.send(Message::Text(payload.to_string().into())).await?;
+    Ok(())
 }
 
 fn bump_volume(volume_percent: &AtomicU8, delta: i16) -> u8 {
@@ -211,10 +292,10 @@ mod tests {
         let muted = AtomicBool::new(false);
         let volume_percent = AtomicU8::new(100);
 
-        apply_pair_control(r#"{"event":"toggle_mute"}"#, &muted, &volume_percent).unwrap();
+        apply_audio_pair_control(PairControlMessage::ToggleMute, &muted, &volume_percent);
         assert!(muted.load(Ordering::Relaxed));
 
-        apply_pair_control(r#"{"event":"toggle_mute"}"#, &muted, &volume_percent).unwrap();
+        apply_audio_pair_control(PairControlMessage::ToggleMute, &muted, &volume_percent);
         assert!(!muted.load(Ordering::Relaxed));
     }
 
@@ -223,10 +304,10 @@ mod tests {
         let muted = AtomicBool::new(false);
         let volume_percent = AtomicU8::new(50);
 
-        apply_pair_control(r#"{"event":"volume_up"}"#, &muted, &volume_percent).unwrap();
+        apply_audio_pair_control(PairControlMessage::VolumeUp, &muted, &volume_percent);
         assert_eq!(volume_percent.load(Ordering::Relaxed), 55);
 
-        apply_pair_control(r#"{"event":"volume_down"}"#, &muted, &volume_percent).unwrap();
+        apply_audio_pair_control(PairControlMessage::VolumeDown, &muted, &volume_percent);
         assert_eq!(volume_percent.load(Ordering::Relaxed), 50);
     }
 }

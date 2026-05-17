@@ -105,17 +105,16 @@ fn open_help_modal(app: &mut App, topic: HelpTopic) {
 }
 
 fn open_settings_modal(app: &mut App) {
-    app.settings_modal_state.open_from_profile(
-        app.profile_state.profile(),
-        app.chat.favorite_room_options(),
-        crate::app::settings_modal::ui::MODAL_WIDTH,
-    );
+    app.show_hub_modal = false;
+    app.settings_modal_state
+        .open_from_profile(app.profile_state.profile());
     app.show_settings = true;
 }
 
 fn open_mod_modal(app: &mut App) {
     app.show_help = false;
     app.show_settings = false;
+    app.show_hub_modal = false;
     app.show_profile_modal = false;
     app.show_bonsai_modal = false;
     app.show_web_chat_qr = false;
@@ -129,6 +128,12 @@ pub(crate) fn handle_post_submit_requests(app: &mut App) {
     if app.chat.take_requested_quit() {
         crate::app::input::trigger_global_quit(app);
     }
+    if let Some(url) = app.chat.take_requested_audio_url() {
+        app.audio.submit_trusted(url);
+    }
+    if let Some(url) = app.chat.take_requested_audio_fallback_url() {
+        app.audio.set_youtube_fallback(url);
+    }
     if let Some(topic) = app.chat.take_requested_help_topic() {
         open_help_modal(app, topic);
     }
@@ -137,6 +142,21 @@ pub(crate) fn handle_post_submit_requests(app: &mut App) {
     }
     if app.chat.take_requested_mod_modal() {
         open_mod_modal(app);
+    }
+    if let Some(upload) = app.chat.take_requested_url_upload() {
+        crate::app::input::trigger_url_image_upload(app, upload.url, upload.room_id);
+    }
+    if let Some(upload) = app.chat.take_requested_clipboard_image_upload() {
+        if app.request_paired_clipboard_image_upload(upload.room_id) {
+            app.banner = Some(Banner::success(
+                "Reading image from paired CLI clipboard...",
+            ));
+        } else {
+            app.chat.clear_pending_clipboard_image_upload();
+            app.banner = Some(Banner::error(
+                "No paired CLI with clipboard image support. Update and run `late`.",
+            ));
+        }
     }
 }
 
@@ -170,6 +190,21 @@ fn switch_room(app: &mut App, delta: isize) {
         app.sync_visible_chat_room();
         app.chat.request_list();
     }
+}
+
+fn toggle_selected_room_favorite(app: &mut App) -> bool {
+    let Some(room_id) = app.chat.selected_favorite_room_id() else {
+        return false;
+    };
+    let added = app.profile_state.toggle_favorite_room(room_id);
+    app.chat
+        .set_favorite_room_ids(app.profile_state.profile().favorite_room_ids.clone());
+    app.banner = Some(if added {
+        Banner::success("Room added to favorites")
+    } else {
+        Banner::success("Room removed from favorites")
+    });
+    true
 }
 
 /// Shared message-list navigation and actions. Consumed by both the chat page
@@ -250,6 +285,9 @@ pub fn handle_message_action_in_room(app: &mut App, room_id: Uuid, byte: u8) -> 
                 app.chat.clear_message_selection();
                 return true;
             }
+        }
+        b'\r' | b'\n' if app.chat.open_selected_news_modal_in_room(room_id) => {
+            return true;
         }
         b'\r' | b'\n' if app.chat.try_jump_to_selected_reply_target_in_room(room_id) => {
             return true;
@@ -342,11 +380,17 @@ pub fn handle_arrow(app: &mut App, key: u8) -> bool {
     if app.chat.discover_selected {
         return super::discover::input::handle_arrow(app, key);
     }
+    if app.chat.feeds_selected {
+        return super::feeds::input::handle_arrow(app, key);
+    }
     if app.chat.news_selected {
         return super::news::input::handle_arrow(app, key);
     }
     if app.chat.showcase_selected {
         return super::showcase::input::handle_arrow(app, key);
+    }
+    if app.chat.work_selected {
+        return super::work::input::handle_arrow(app, key);
     }
     handle_message_arrow(app, key)
 }
@@ -399,6 +443,18 @@ pub fn handle_byte(app: &mut App, byte: u8) -> bool {
         return super::discover::input::handle_byte(app, byte);
     }
 
+    if app.chat.feeds_selected {
+        if is_next_room_key(byte) {
+            switch_room(app, 1);
+            return true;
+        }
+        if is_prev_room_key(byte) {
+            switch_room(app, -1);
+            return true;
+        }
+        return super::feeds::input::handle_byte(app, byte);
+    }
+
     if app.chat.news_selected {
         // Room-switch keys still work when a virtual room is selected.
         if is_next_room_key(byte) {
@@ -424,7 +480,23 @@ pub fn handle_byte(app: &mut App, byte: u8) -> bool {
         return super::showcase::input::handle_byte(app, byte);
     }
 
+    if app.chat.work_selected {
+        if is_next_room_key(byte) {
+            switch_room(app, 1);
+            return true;
+        }
+        if is_prev_room_key(byte) {
+            switch_room(app, -1);
+            return true;
+        }
+        return super::work::input::handle_byte(app, byte);
+    }
+
     if handle_message_action(app, byte) {
+        return true;
+    }
+
+    if matches!(byte, b'f' | b'F') && toggle_selected_room_favorite(app) {
         return true;
     }
 
@@ -450,7 +522,6 @@ pub fn handle_byte(app: &mut App, byte: u8) -> bool {
                     .map_or(&*app.connect_url, |p| p.0);
                 let token = registry.create_link(app.user_id, username);
                 let url = format!("{}/chat/{}", base_url, token);
-                app.pending_clipboard = Some(url.clone());
                 app.web_chat_qr_url = Some(url);
                 app.show_web_chat_qr = true;
             }

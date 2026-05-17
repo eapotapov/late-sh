@@ -1,4 +1,7 @@
-use crate::app::{ai::svc::AiService, chat::svc::ChatService};
+use crate::app::{
+    ai::svc::AiService,
+    chat::svc::{ChatService, SendGeneralMessageTask},
+};
 use anyhow::{Context, Result};
 use late_core::models::article::{ArticleEvent, ArticleFeedItem, ArticleSnapshot, NEWS_MARKER};
 use late_core::{
@@ -7,12 +10,13 @@ use late_core::{
         article::{Article, ArticleParams},
         article_feed_read::ArticleFeedRead,
         chat_message::ChatMessage,
-        chat_room::ChatRoom,
+        moderation_audit_log::ModerationAuditLog,
         user::User,
     },
     telemetry::TracedExt,
 };
 use serde::Deserialize;
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
@@ -206,6 +210,16 @@ impl ArticleService {
                     if count == 0 {
                         anyhow::bail!("Article already deleted");
                     }
+                    ModerationAuditLog::record_if(
+                        &client,
+                        is_admin && article.user_id != user_id,
+                        user_id,
+                        "article_delete",
+                        "article",
+                        Some(article_id),
+                        json!({ "target_user_id": article.user_id, "url": article.url }),
+                    )
+                    .await?;
 
                     // Delete the news announcement from general chat
                     if let Err(e) = ChatMessage::delete_news_by_user_and_url(
@@ -240,6 +254,7 @@ impl ArticleService {
                         service.publish_event(ArticleEvent::Failed {
                             user_id,
                             error: e.to_string(),
+                            url: None,
                         });
                     }
                 }
@@ -282,6 +297,7 @@ impl ArticleService {
                     service.publish_event(ArticleEvent::Failed {
                         user_id,
                         error: e.to_string(),
+                        url: Some(target_url.clone()),
                     });
                 }
             }
@@ -341,22 +357,15 @@ impl ArticleService {
         }
 
         // Post the announcement into #general via the same send path as any
-        // other message. No special-case task needed — resolve the room id
-        // here and call send_message_task like a normal composer submit.
-        let general_room_id = {
-            let client = self.db.get().await?;
-            ChatRoom::find_general(&client).await?.map(|room| room.id)
-        };
-        if let Some(room_id) = general_room_id {
-            self.chat_service.send_message_task(
+        // other message, preserving the normal composer success/failure event.
+        self.chat_service
+            .send_general_message_task(SendGeneralMessageTask {
                 user_id,
-                room_id,
-                Some("general".to_string()),
-                announcement,
-                Uuid::now_v7(),
-                false,
-            );
-        }
+                body: announcement,
+                request_id: Some(Uuid::now_v7()),
+                join_if_needed: false,
+                failure_log: "failed to share news in general chat",
+            });
 
         // Refresh the shared feed snapshot immediately so clients see the new item
         // without waiting for the periodic poll tick.
@@ -381,7 +390,10 @@ impl ArticleService {
 
         // 5. Publish Event
         tracing::info!(%url, "publishing ArticleEvent::Created");
-        self.publish_event(ArticleEvent::Created { user_id });
+        self.publish_event(ArticleEvent::Created {
+            user_id,
+            url: url.to_string(),
+        });
 
         Ok(())
     }

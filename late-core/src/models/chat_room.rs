@@ -1,5 +1,6 @@
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
+use deadpool_postgres::GenericClient;
 use tokio_postgres::Client;
 use uuid::Uuid;
 
@@ -240,18 +241,26 @@ impl ChatRoom {
             .query(
                 "SELECT r.id,
                         r.slug,
-                        COUNT(DISTINCT m.user_id)::bigint AS member_count,
-                        COUNT(DISTINCT msg.id)::bigint AS message_count,
-                        MAX(msg.created) AS last_message_at
+                        COALESCE(m.member_count, 0)::bigint AS member_count,
+                        COALESCE(msg.message_count, 0)::bigint AS message_count,
+                        msg.last_message_at
                  FROM chat_rooms r
-                 LEFT JOIN chat_room_members m ON m.room_id = r.id
-                 LEFT JOIN chat_messages msg ON msg.room_id = r.id
+                 LEFT JOIN LATERAL (
+                    SELECT COUNT(*)::bigint AS member_count
+                    FROM chat_room_members m
+                    WHERE m.room_id = r.id
+                 ) m ON true
+                 LEFT JOIN LATERAL (
+                    SELECT COUNT(*)::bigint AS message_count,
+                           MAX(created) AS last_message_at
+                    FROM chat_messages msg
+                    WHERE msg.room_id = r.id
+                 ) msg ON true
                  WHERE r.kind = 'topic'
                    AND r.visibility = 'public'
                    AND r.permanent = false
-                 GROUP BY r.id, r.slug
                  ORDER BY
-                    COALESCE(MAX(msg.created), r.created) DESC,
+                    COALESCE(msg.last_message_at, r.created) DESC,
                     message_count DESC,
                     member_count DESC,
                     r.slug ASC",
@@ -422,6 +431,34 @@ impl ChatRoom {
             )
             .await?;
         Ok(count)
+    }
+
+    pub async fn rename_non_dm_slug(
+        client: &impl GenericClient,
+        room_id: Uuid,
+        new_slug: &str,
+    ) -> Result<u64> {
+        let conflict = client
+            .query_opt(
+                "SELECT id FROM chat_rooms
+                 WHERE slug = $1 AND kind <> 'dm' AND id <> $2
+                 LIMIT 1",
+                &[&new_slug, &room_id],
+            )
+            .await?;
+        if conflict.is_some() {
+            bail!("room #{new_slug} already exists");
+        }
+
+        let updated = client
+            .execute(
+                "UPDATE chat_rooms
+                 SET slug = $2, updated = current_timestamp
+                 WHERE id = $1 AND kind <> 'dm'",
+                &[&room_id, &new_slug],
+            )
+            .await?;
+        Ok(updated)
     }
 }
 

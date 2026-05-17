@@ -8,6 +8,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info};
 
 mod audio;
+mod clipboard;
 
 mod config;
 mod identity;
@@ -66,7 +67,6 @@ async fn main() -> Result<()> {
     let (token_tx, token_rx) = oneshot::channel();
     let SshProcess {
         completion_task,
-        input_task,
         resize_handle,
         input_gate,
     } = spawn_ssh(&config, &ssh_identity, token_tx).await?;
@@ -90,7 +90,6 @@ async fn main() -> Result<()> {
 
     audio.stop.store(true, Ordering::Relaxed);
     resize_task.abort();
-    input_task.abort();
     ws_task.abort();
     debug!(?ssh_exit, "ssh session ended");
     ssh_exit.ensure_success()?;

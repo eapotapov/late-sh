@@ -5,7 +5,7 @@ on:
     types: [published]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ endsWith(github.ref, '-cli') }}
+  group: ${{ endsWith(github.ref, '-cli') && format('deploy-cli-{0}', github.event.release.prerelease && 'staging' || 'production') || format('{0}-{1}', github.workflow, github.run_id) }}
   cancel-in-progress: true
 
 permissions:
@@ -48,7 +48,7 @@ jobs:
           - runner: macos-14
             target: aarch64-apple-darwin
             binary_name: late
-          - runner: windows-latest
+          - runner: windows-2025
             target: x86_64-pc-windows-msvc
             binary_name: late.exe
     steps:
@@ -68,7 +68,7 @@ jobs:
 
       - name: set_up_android_sdk
         if: matrix.android == true
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4.0.1
 
       - name: install_android_ndk
         if: matrix.android == true

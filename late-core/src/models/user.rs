@@ -32,9 +32,9 @@ const NOTIFY_COOLDOWN_MINS_KEY: &str = "notify_cooldown_mins";
 const NOTIFY_FORMAT_KEY: &str = "notify_format";
 const ENABLE_BACKGROUND_COLOR_KEY: &str = "enable_background_color";
 const SHOW_DASHBOARD_HEADER_KEY: &str = "show_dashboard_header";
-const SHOW_DASHBOARD_ROOM_SHOWCASES_KEY: &str = "show_dashboard_room_showcases";
+const SHOW_DASHBOARD_WIRE_KEY: &str = "show_dashboard_wire";
 const SHOW_RIGHT_SIDEBAR_KEY: &str = "show_right_sidebar";
-const SHOW_GAMES_SIDEBAR_KEY: &str = "show_games_sidebar";
+const SHOW_ROOM_LIST_SIDEBAR_KEY: &str = "show_room_list_sidebar";
 const SHOW_SETTINGS_ON_CONNECT_KEY: &str = "show_settings_on_connect";
 const FAVORITE_ROOM_IDS_KEY: &str = "favorite_room_ids";
 const BIO_KEY: &str = "bio";
@@ -303,6 +303,24 @@ impl User {
         Ok(())
     }
 
+    pub async fn rename(
+        client: &impl GenericClient,
+        user_id: Uuid,
+        username: &str,
+    ) -> Result<Self> {
+        let username = sanitize_username_input(username);
+        let row = client
+            .query_one(
+                "UPDATE users
+                 SET username = $1, updated = current_timestamp
+                 WHERE id = $2
+                 RETURNING *",
+                &[&username, &user_id],
+            )
+            .await?;
+        Ok(Self::from(row))
+    }
+
     async fn settings_for_user(client: &Client, user_id: Uuid) -> Result<Value> {
         let row = client
             .query_opt("SELECT settings FROM users WHERE id = $1", &[&user_id])
@@ -423,11 +441,11 @@ pub fn extract_show_dashboard_header(settings: &Value) -> bool {
         .unwrap_or(true)
 }
 
-pub fn extract_show_dashboard_room_showcases(settings: &Value) -> bool {
+pub fn extract_show_dashboard_wire(settings: &Value) -> bool {
     settings
-        .get(SHOW_DASHBOARD_ROOM_SHOWCASES_KEY)
+        .get(SHOW_DASHBOARD_WIRE_KEY)
         .and_then(Value::as_bool)
-        .unwrap_or(true)
+        .unwrap_or_else(|| extract_show_dashboard_header(settings))
 }
 
 pub fn extract_show_right_sidebar(settings: &Value) -> bool {
@@ -437,9 +455,9 @@ pub fn extract_show_right_sidebar(settings: &Value) -> bool {
         .unwrap_or(true)
 }
 
-pub fn extract_show_games_sidebar(settings: &Value) -> bool {
+pub fn extract_show_room_list_sidebar(settings: &Value) -> bool {
     settings
-        .get(SHOW_GAMES_SIDEBAR_KEY)
+        .get(SHOW_ROOM_LIST_SIDEBAR_KEY)
         .and_then(Value::as_bool)
         .unwrap_or(true)
 }
@@ -644,6 +662,15 @@ mod tests {
     }
 
     #[test]
+    fn extract_show_dashboard_wire_defaults_to_dashboard_header() {
+        let settings = json!({});
+        assert!(extract_show_dashboard_wire(&settings));
+
+        let settings = json!({ "show_dashboard_header": false });
+        assert!(!extract_show_dashboard_wire(&settings));
+    }
+
+    #[test]
     fn extract_enable_background_color_defaults_to_true() {
         let settings = json!({});
         assert!(extract_enable_background_color(&settings));
@@ -662,21 +689,30 @@ mod tests {
     }
 
     #[test]
+    fn extract_show_dashboard_wire_reads_explicit_false() {
+        let settings = json!({
+            "show_dashboard_header": true,
+            "show_dashboard_wire": false
+        });
+        assert!(!extract_show_dashboard_wire(&settings));
+    }
+
+    #[test]
     fn extract_show_right_sidebar_reads_explicit_false() {
         let settings = json!({ "show_right_sidebar": false });
         assert!(!extract_show_right_sidebar(&settings));
     }
 
     #[test]
-    fn extract_show_games_sidebar_defaults_to_true() {
+    fn extract_show_room_list_sidebar_defaults_to_true() {
         let settings = json!({});
-        assert!(extract_show_games_sidebar(&settings));
+        assert!(extract_show_room_list_sidebar(&settings));
     }
 
     #[test]
-    fn extract_show_games_sidebar_reads_explicit_false() {
-        let settings = json!({ "show_games_sidebar": false });
-        assert!(!extract_show_games_sidebar(&settings));
+    fn extract_show_room_list_sidebar_reads_explicit_false() {
+        let settings = json!({ "show_room_list_sidebar": false });
+        assert!(!extract_show_room_list_sidebar(&settings));
     }
 
     #[test]

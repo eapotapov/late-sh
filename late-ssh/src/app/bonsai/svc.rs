@@ -6,7 +6,7 @@ use rand_core::{OsRng, RngCore};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::state::ActivityEvent;
+use crate::app::activity::event::ActivityEvent;
 
 const MISSED_PRUNE_GROWTH_LOSS: i32 = 10;
 
@@ -49,11 +49,9 @@ impl BonsaiService {
 
                     let username =
                         late_core::models::profile::fetch_username(&client, user_id).await;
-                    let _ = self.activity_feed.send(ActivityEvent {
-                        username,
-                        action: format!("lost their bonsai ({survived}d)"),
-                        at: std::time::Instant::now(),
-                    });
+                    let _ = self
+                        .activity_feed
+                        .send(ActivityEvent::bonsai_lost(user_id, username, survived));
                 }
             }
             tree
@@ -96,27 +94,10 @@ impl BonsaiService {
         let client = self.db.get().await?;
         let today = chrono::Utc::now().date_naive();
 
-        let tree = Tree::find_by_user_id(&client, user_id).await?;
-        let Some(tree) = tree else {
-            return Ok(false);
-        };
-        if !tree.is_alive {
+        if !Tree::water_and_add_growth_if_available(&client, user_id, today, unlimited).await? {
             return Ok(false);
         }
-        if !unlimited && tree.last_watered == Some(today) {
-            return Ok(false); // Already watered today
-        }
-
-        Tree::water(&client, user_id, today).await?;
         DailyCare::mark_watered(&client, user_id, today).await?;
-
-        // Grant growth points: base 10, bonus if consecutive day
-        let bonus = if let Some(last) = tree.last_watered {
-            if (today - last).num_days() == 1 { 5 } else { 0 }
-        } else {
-            0
-        };
-        Tree::add_growth(&client, user_id, 10 + bonus).await?;
 
         // Grant chips for watering
         late_core::models::chips::UserChips::add_bonus(
@@ -128,11 +109,9 @@ impl BonsaiService {
 
         // Broadcast
         let username = late_core::models::profile::fetch_username(&client, user_id).await;
-        let _ = self.activity_feed.send(ActivityEvent {
-            username,
-            action: "watered their bonsai".to_string(),
-            at: std::time::Instant::now(),
-        });
+        let _ = self
+            .activity_feed
+            .send(ActivityEvent::bonsai_watered(user_id, username));
 
         Ok(true)
     }

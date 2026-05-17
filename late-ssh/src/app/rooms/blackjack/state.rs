@@ -9,7 +9,7 @@ use tokio::sync::{
 use uuid::Uuid;
 
 use crate::app::{
-    games::cards::{CardRank, CardSuit, PlayingCard},
+    arcade::cards::{CardRank, CardSuit, PlayingCard},
     rooms::blackjack::{
         player::BlackjackPlayerInfo,
         svc::{BlackjackEvent, BlackjackService},
@@ -23,7 +23,7 @@ pub const BLACKJACK_TARGET: u8 = 21;
 pub const DEALER_STAND_ON: u8 = 17;
 pub const SHOE_DECKS: usize = 6;
 pub const SHOE_PENETRATION: usize = 52;
-const SETTLEMENT_MIN_VIEW_MS: u64 = 1500;
+pub(super) const SETTLEMENT_MIN_VIEW_MS: u64 = 1200;
 
 pub const DEALER_STANDS_ON_SOFT_17: bool = true;
 
@@ -331,6 +331,18 @@ impl State {
             snapshot_rx,
             event_rx,
         }
+    }
+
+    pub fn room_id(&self) -> Uuid {
+        self.svc.room_id()
+    }
+
+    pub fn balance(&self) -> i64 {
+        self.balance
+    }
+
+    pub fn set_balance(&mut self, balance: i64) {
+        self.balance = balance;
     }
 
     pub fn tick(&mut self) {

@@ -1,3 +1,4 @@
+use crate::app::chat::list_ui::{draw_mine_only_status, filtered_list_areas};
 use crate::app::common::theme;
 use crate::app::common::{composer, primitives::format_relative_time};
 use chrono::{DateTime, Utc};
@@ -18,25 +19,17 @@ pub struct ShowcaseListView<'a> {
     pub current_user_id: uuid::Uuid,
     pub is_admin: bool,
     pub marker_read_at: Option<DateTime<Utc>>,
+    pub mine_only: bool,
 }
 
 const ITEM_HEIGHT: u16 = 7;
 const SUMMARY_LINES: usize = 3;
 
 pub fn draw_showcase_list(frame: &mut Frame, area: Rect, view: &ShowcaseListView<'_>) {
-    let selected = if view.items.is_empty() {
-        0
-    } else {
-        view.selected_index.min(view.items.len() - 1) + 1
-    };
-    let title = format!(" Showcases ({selected}/{}) ", view.items.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(theme::BORDER()));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let (status_area, inner) = filtered_list_areas(area, view.mine_only);
+    if let Some(status_area) = status_area {
+        draw_mine_only_status(frame, status_area, "showcases");
+    }
 
     if view.items.is_empty() {
         let text = Text::from(vec![
@@ -227,9 +220,9 @@ pub fn draw_showcase_composer(frame: &mut Frame, area: Rect, view: &ShowcaseComp
     let title = if !composing {
         " Showcase "
     } else if editing {
-        " Editing · Tab/S+Tab switch · Enter submit · Alt+Enter newline · Esc cancel "
+        " Editing · Tab/S+Tab switch · Enter submit · Alt+Enter/Ctrl+J newline · Esc cancel "
     } else {
-        " New showcase · Tab/S+Tab switch · Enter submit · Alt+Enter newline · Esc cancel "
+        " New showcase · Tab/S+Tab switch · Enter submit · Alt+Enter/Ctrl+J newline · Esc cancel "
     };
     let border_style = if composing {
         Style::default().fg(theme::BORDER_ACTIVE())
@@ -245,7 +238,7 @@ pub fn draw_showcase_composer(frame: &mut Frame, area: Rect, view: &ShowcaseComp
 
     if !composing {
         let hint = Paragraph::new(Line::from(Span::styled(
-            " j/k navigate · Enter copy URL · i compose · e edit own · d delete own",
+            " j/k navigate · Enter copy URL · i compose · e edit own · d delete own · / filter mine",
             Style::default().fg(theme::TEXT_DIM()),
         )));
         frame.render_widget(hint, inner);

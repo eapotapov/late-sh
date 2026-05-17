@@ -17,20 +17,21 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{self, Duration, Instant};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as TokioMutex, Notify, OwnedSemaphorePermit};
 use tokio::task::JoinSet;
 use tokio::time::{MissedTickBehavior, timeout};
 
+use crate::app::activity::event::ActivityEvent;
 use crate::app::{
     common::theme,
     state::{App, SessionConfig},
 };
 use crate::authz::Permissions as AuthzPermissions;
 use crate::metrics;
-use crate::state::{ActiveSession, ActivityEvent, State};
+use crate::state::{ActiveSession, State};
 
 static FRAME_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 const PROXY_V1_MAX_LEN: usize = 108;
@@ -94,6 +95,7 @@ struct ClientHandler {
 
     /// Session bindings
     channel: Option<Channel<Msg>>,
+    app_channel_id: Option<ChannelId>,
     app: Option<Arc<TokioMutex<crate::app::state::App>>>,
     /// Signaled by input/resize paths to request an immediate (world-stateless)
     /// render, so typed characters echo without waiting for the next world tick.
@@ -299,6 +301,7 @@ impl Server {
             active_user_incremented: false,
             over_limit,
             channel: None,
+            app_channel_id: None,
             app: None,
             render_signal: None,
             input_tx: None,
@@ -586,6 +589,7 @@ impl russh::server::Handler for ClientHandler {
             metrics::add_ssh_session(1);
         }
 
+        let user_id = user.id;
         let username = user.username.clone();
 
         tracing::info!(
@@ -596,11 +600,10 @@ impl russh::server::Handler for ClientHandler {
 
         self.user = Some(user);
         self.activity_feed_rx = Some(self.state.activity_feed.subscribe());
-        let _ = self.state.activity_feed.send(ActivityEvent {
-            username,
-            action: "joined".to_string(),
-            at: time::Instant::now(),
-        });
+        let _ = self
+            .state
+            .activity_feed
+            .send(ActivityEvent::joined(user_id, username));
         Ok(Auth::Accept)
     }
 
@@ -726,7 +729,21 @@ impl russh::server::Handler for ClientHandler {
                     None
                 }
             };
-
+        let initial_snake_game = match self.state.snake_service.load_game(user_id).await {
+            Ok(game) => game,
+            Err(e) => {
+                tracing::warn!(error = ?e, "failed to load snake game state");
+                None
+            }
+        };
+        let initial_snake_high_score = match self.state.snake_service.load_high_score(user_id).await
+        {
+            Ok(score) => score,
+            Err(e) => {
+                tracing::warn!(error = ?e, "failed to load snake high score");
+                None
+            }
+        };
         let initial_sudoku_games = match self.state.sudoku_service.load_games(user_id).await {
             Ok(g) => g,
             Err(e) => {
@@ -769,11 +786,11 @@ impl russh::server::Handler for ClientHandler {
             }
         };
 
-        // Grant daily chip stipend on login
+        // Ensure the user's chip balance row exists.
         let initial_chip_balance = match self.state.chip_service.ensure_chips(user_id).await {
             Ok(chips) => chips.balance,
             Err(e) => {
-                tracing::warn!(error = ?e, "failed to grant daily chip stipend");
+                tracing::warn!(error = ?e, "failed to ensure chip balance");
                 0
             }
         };
@@ -797,18 +814,24 @@ impl russh::server::Handler for ClientHandler {
             rows: row_height as u16,
 
             // Services / data sources
+            audio_service: self.state.audio_service.clone(),
             vote_service,
             chat_service,
             notification_service: self.state.notification_service.clone(),
             article_service,
+            feed_service: self.state.feed_service.clone(),
             showcase_service: self.state.showcase_service.clone(),
+            work_service: self.state.work_service.clone(),
             profile_service,
             twenty_forty_eight_service,
             initial_2048_game,
             initial_2048_high_score,
             tetris_service: self.state.tetris_service.clone(),
+            snake_service: self.state.snake_service.clone(),
             initial_tetris_game,
+            initial_snake_game,
             initial_tetris_high_score,
+            initial_snake_high_score,
             sudoku_service,
             initial_sudoku_games,
             nonogram_service,
@@ -818,7 +841,7 @@ impl russh::server::Handler for ClientHandler {
             minesweeper_service: self.state.minesweeper_service.clone(),
             initial_minesweeper_games,
             rooms_service: self.state.rooms_service.clone(),
-            blackjack_table_manager: self.state.blackjack_table_manager.clone(),
+            room_game_registry: self.state.room_game_registry.clone(),
             dartboard_server: self.state.dartboard_server.clone(),
             dartboard_provenance: self.state.dartboard_provenance.clone(),
             artboard_snapshot_service: crate::app::artboard::svc::ArtboardSnapshotService::new(
@@ -842,6 +865,7 @@ impl russh::server::Handler for ClientHandler {
             now_playing_rx: Some(self.state.now_playing_rx.clone()),
             active_users: Some(self.state.active_users.clone()),
             activity_feed_rx: self.activity_feed_rx.take(),
+            initial_activity: self.state.activity_history.lock_recover().clone(),
             user_id,
             permissions: AuthzPermissions::new(
                 user.is_admin || self.state.config.force_admin,
@@ -965,6 +989,7 @@ impl russh::server::Handler for ClientHandler {
                 anyhow::anyhow!("session input receiver missing during shell request")
             })?;
             let channel_id = chan.id();
+            self.app_channel_id = Some(channel_id);
             let handle = session.handle();
 
             if self.cli_mode
@@ -1042,11 +1067,15 @@ impl russh::server::Handler for ClientHandler {
     #[tracing::instrument(skip(self, data, _session), fields(peer = ?self.peer_addr, len = data.len()))]
     async fn data(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         tracing::debug!(len = data.len(), "received input data");
+        if self.app_channel_id != Some(channel) {
+            tracing::debug!(?channel, "ignoring input from non-app channel");
+            return Ok(());
+        }
         if self.app.is_none() {
             return Ok(());
         }
@@ -1083,7 +1112,9 @@ impl russh::server::Handler for ClientHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         tracing::debug!(?channel, "client sent channel EOF");
-        if let Some(app) = self.app.as_ref() {
+        if self.app_channel_id == Some(channel)
+            && let Some(app) = self.app.as_ref()
+        {
             let mut app = app.lock().await;
             app.running = false;
         }
@@ -1097,9 +1128,12 @@ impl russh::server::Handler for ClientHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         tracing::debug!(?channel, "client closed channel");
-        if let Some(app) = self.app.as_ref() {
+        if self.app_channel_id == Some(channel)
+            && let Some(app) = self.app.as_ref()
+        {
             let mut app = app.lock().await;
             app.running = false;
+            self.app_channel_id = None;
         }
         Ok(())
     }

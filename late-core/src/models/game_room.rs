@@ -1,4 +1,5 @@
 use anyhow::Result;
+use deadpool_postgres::GenericClient;
 use serde_json::Value;
 use std::time::Duration;
 use tokio_postgres::Client;
@@ -7,12 +8,18 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GameKind {
     Blackjack,
+    Poker,
+    TicTacToe,
 }
 
 impl GameKind {
+    pub const ALL: [Self; 3] = [Self::Blackjack, Self::Poker, Self::TicTacToe];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Blackjack => "blackjack",
+            Self::Poker => "poker",
+            Self::TicTacToe => "tictactoe",
         }
     }
 }
@@ -23,12 +30,21 @@ impl std::fmt::Display for GameKind {
     }
 }
 
+/// Chat-body marker for "user took a seat at a game room" announcements.
+/// The chat renderer detects this prefix and replaces the plain message
+/// with a styled card. Payload after the marker is
+/// `{game_kind} || {room_name} || {meta}`.
+pub const ROOM_SEAT_MARKER: &str = "---ROOM-SEAT---";
+pub const ROOM_SEAT_SEPARATOR: &str = " || ";
+
 impl TryFrom<&str> for GameKind {
     type Error = anyhow::Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
             "blackjack" => Ok(Self::Blackjack),
+            "poker" => Ok(Self::Poker),
+            "tictactoe" => Ok(Self::TicTacToe),
             _ => Err(anyhow::anyhow!("unknown game kind: {}", value)),
         }
     }
@@ -231,5 +247,21 @@ impl GameRoom {
             )
             .await?;
         Ok(rows.into_iter().map(Self::from).collect())
+    }
+
+    pub async fn rename_by_chat_room_id(
+        client: &impl GenericClient,
+        chat_room_id: Uuid,
+        new_slug: &str,
+    ) -> Result<u64> {
+        let updated = client
+            .execute(
+                "UPDATE game_rooms
+                 SET slug = $2, updated = current_timestamp
+                 WHERE chat_room_id = $1",
+                &[&chat_room_id, &new_slug],
+            )
+            .await?;
+        Ok(updated)
     }
 }

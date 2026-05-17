@@ -45,26 +45,20 @@ impl Notification {
             return Ok(0);
         }
 
-        // Build a multi-row INSERT: ($1, $2, $3, $4), ($5, $2, $3, $4), ...
-        // where $2=actor_id, $3=message_id, $4=room_id are shared, and each $N is a user_id.
-        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-            Vec::with_capacity(user_ids.len() + 3);
-        params.push(&actor_id); // $1
-        params.push(&message_id); // $2
-        params.push(&room_id); // $3
-
-        let mut value_clauses = Vec::with_capacity(user_ids.len());
-        for (i, uid) in user_ids.iter().enumerate() {
-            params.push(uid); // $4, $5, $6, ...
-            value_clauses.push(format!("(${}, $1, $2, $3)", i + 4));
-        }
-
-        let query = format!(
-            "INSERT INTO notifications (user_id, actor_id, message_id, room_id) VALUES {} ON CONFLICT DO NOTHING",
-            value_clauses.join(", ")
-        );
-
-        let count = client.execute(&query, &params).await?;
+        let count = client
+            .execute(
+                "INSERT INTO notifications (user_id, actor_id, message_id, room_id)
+                 SELECT mentioned.user_id, $1, $2, $3
+                 FROM UNNEST($4::uuid[]) AS mentioned(user_id)
+                 JOIN users recipient ON recipient.id = mentioned.user_id
+                 WHERE NOT (
+                    COALESCE(recipient.settings, '{}'::jsonb)
+                    @> jsonb_build_object('ignored_user_ids', jsonb_build_array(($1::uuid)::text))
+                 )
+                 ON CONFLICT DO NOTHING",
+                &[&actor_id, &message_id, &room_id, &user_ids],
+            )
+            .await?;
         Ok(count)
     }
 
@@ -82,9 +76,23 @@ impl Notification {
                         LEFT(m.body, 120) AS message_preview
                  FROM notifications n
                  JOIN users u ON u.id = n.actor_id
+                 JOIN users recipient ON recipient.id = n.user_id
                  JOIN chat_rooms r ON r.id = n.room_id
                  JOIN chat_messages m ON m.id = n.message_id
                  WHERE n.user_id = $1
+                   AND NOT (
+                        COALESCE(recipient.settings, '{}'::jsonb)
+                        @> jsonb_build_object(
+                            'ignored_user_ids',
+                            jsonb_build_array(n.actor_id::text)
+                        )
+                   )
+                   AND r.kind <> 'game'
+                   AND (
+                        r.kind = 'dm'
+                        OR r.permanent = true
+                        OR r.visibility IN ('public', 'private')
+                   )
                  ORDER BY n.created DESC
                  LIMIT $2",
                 &[&user_id, &limit],
@@ -109,7 +117,32 @@ impl Notification {
 
     /// Count unread notifications for a user.
     pub async fn unread_count(client: &Client, user_id: Uuid) -> Result<i64> {
-        MentionFeedRead::unread_count_for_user(client, user_id).await
+        let row = client
+            .query_one(
+                "SELECT COUNT(n.id)::bigint AS unread_count
+                 FROM notifications n
+                 JOIN chat_rooms r ON r.id = n.room_id
+                 JOIN users recipient ON recipient.id = n.user_id
+                 LEFT JOIN mention_feed_reads mfr ON mfr.user_id = $1
+                 WHERE n.user_id = $1
+                   AND n.created > COALESCE(mfr.last_read_at, '-infinity'::timestamptz)
+                   AND NOT (
+                        COALESCE(recipient.settings, '{}'::jsonb)
+                        @> jsonb_build_object(
+                            'ignored_user_ids',
+                            jsonb_build_array(n.actor_id::text)
+                        )
+                   )
+                   AND r.kind <> 'game'
+                   AND (
+                        r.kind = 'dm'
+                        OR r.permanent = true
+                        OR r.visibility IN ('public', 'private')
+                   )",
+                &[&user_id],
+            )
+            .await?;
+        Ok(row.get("unread_count"))
     }
 
     /// Mark all unread notifications as read for a user.
@@ -146,6 +179,14 @@ impl Notification {
                    ON m.room_id = r.id AND m.user_id = u.id \
                  WHERE LOWER(u.username) = ANY($1) \
                    AND u.id <> $2 \
+                   AND NOT (
+                        COALESCE(u.settings, '{}'::jsonb)
+                        @> jsonb_build_object(
+                            'ignored_user_ids',
+                            jsonb_build_array(($2::uuid)::text)
+                        )
+                   ) \
+                   AND r.kind <> 'game' \
                    AND (
                         (r.kind = 'dm' AND u.id IN (r.dm_user_a, r.dm_user_b))
                         OR (r.kind <> 'dm' AND r.visibility = 'private' AND m.user_id IS NOT NULL)

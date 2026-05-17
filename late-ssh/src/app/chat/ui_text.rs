@@ -3,11 +3,13 @@ use ratatui::{
     text::{Line, Span},
 };
 
-use crate::app::common::{
-    markdown::{pad_to_width, render_body_to_lines, wrap_plain_line},
-    theme,
+use crate::app::common::{markdown::render_body_to_lines, theme};
+use late_core::models::{
+    article::NEWS_MARKER,
+    chat_message_reaction::ChatMessageReactionSummary,
+    game_room::{ROOM_SEAT_MARKER, ROOM_SEAT_SEPARATOR},
 };
-use late_core::models::{article::NEWS_MARKER, chat_message_reaction::ChatMessageReactionSummary};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const NEWS_SEPARATOR: &str = " || ";
 
@@ -59,6 +61,7 @@ pub(super) fn wrap_chat_entry_to_lines(
     body_style: Style,
     mentions_us: bool,
     continuation: bool,
+    inline_image_lines: Option<&[Line<'static>]>,
     reactions: &[ChatMessageReactionSummary],
 ) -> Vec<Line<'static>> {
     let pad = if mentions_us {
@@ -66,7 +69,9 @@ pub(super) fn wrap_chat_entry_to_lines(
     } else {
         Span::raw(" ")
     };
-    let mut lines = if let Some(news) = parse_news_payload(body) {
+    let mut lines = if let Some(seat) = parse_room_seat_payload(body) {
+        wrap_room_seat_to_lines(stamp, prefix, width, author_style, seat)
+    } else if let Some(news) = parse_news_payload(body) {
         wrap_news_to_lines(stamp, prefix, width, author_style, news)
     } else {
         wrap_message_to_lines(
@@ -80,23 +85,31 @@ pub(super) fn wrap_chat_entry_to_lines(
             continuation,
         )
     };
+
+    if let Some(img_lines) = inline_image_lines {
+        for img_line in img_lines {
+            let mut spans = vec![pad.clone(), Span::raw(" ")];
+            spans.extend(img_line.spans.iter().cloned());
+            lines.push(Line::from(spans));
+        }
+    }
+
     lines.extend(render_reaction_footer_lines(reactions, width, pad));
     lines
 }
 
 // ── News formatting ─────────────────────────────────────────
 
-#[derive(Debug, Clone)]
-struct NewsPayload {
-    title: String,
-    summary: String,
-    url: String,
-    ascii_art: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewsPayload {
+    pub title: String,
+    pub summary: String,
+    pub url: String,
+    pub ascii_art: String,
 }
 
-fn parse_news_payload(body: &str) -> Option<NewsPayload> {
-    let marker_pos = body.find(NEWS_MARKER)?;
-    let raw = body[marker_pos + NEWS_MARKER.len()..].trim();
+pub(crate) fn parse_news_payload(body: &str) -> Option<NewsPayload> {
+    let raw = body.trim_start().strip_prefix(NEWS_MARKER)?.trim();
     if raw.is_empty() {
         return Some(NewsPayload {
             title: "news update".to_string(),
@@ -122,6 +135,21 @@ fn parse_news_payload(body: &str) -> Option<NewsPayload> {
         url,
         ascii_art,
     })
+}
+
+pub(crate) fn format_news_ascii_art_for_display(ascii: &str, max_rows: usize) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+
+    ascii
+        .replace("\\n", "\n")
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .take(max_rows)
+        .collect()
 }
 
 fn wrap_news_to_lines(
@@ -160,10 +188,13 @@ fn wrap_news_to_lines(
     }
 
     let inner_width = width.saturating_sub(2).max(1);
-    let ascii_lines = raw_ascii_preview_lines(&payload.ascii_art, 6);
+    let mut ascii_lines = format_news_ascii_art_for_display(&payload.ascii_art, 6);
+    if ascii_lines.is_empty() {
+        ascii_lines.push("........".to_string());
+    }
     let ascii_max_width = ascii_lines
         .iter()
-        .map(|line| line.chars().count())
+        .map(|line| UnicodeWidthStr::width(line.as_str()))
         .max()
         .unwrap_or(8)
         .max(8);
@@ -176,7 +207,7 @@ fn wrap_news_to_lines(
 
     let mut right_rows: Vec<(String, Style)> = Vec::new();
     if !title.is_empty() {
-        for row in wrap_plain_line(&format!("📰 {title}"), right_width) {
+        for row in wrap_plain_display_width(&format!("📰 {title}"), right_width) {
             right_rows.push((row, title_style));
         }
     }
@@ -187,7 +218,7 @@ fn wrap_news_to_lines(
         }
     }
     if !url.is_empty() {
-        for row in wrap_plain_line(&url, right_width) {
+        for row in wrap_plain_display_width(&url, right_width) {
             right_rows.push((row, meta_style));
         }
     }
@@ -195,10 +226,10 @@ fn wrap_news_to_lines(
         right_rows.push(("📰 news update".to_string(), title_style));
     }
 
-    lines.push(Line::from(Span::styled(
-        format!("┌{}┐", "─".repeat(inner_width)),
-        border_style,
-    )));
+    lines.push(Line::from(vec![
+        pad.clone(),
+        Span::styled("─".repeat(inner_width), border_style),
+    ]));
 
     let row_count = ascii_lines.len().max(right_rows.len()).max(1);
     for idx in 0..row_count {
@@ -208,23 +239,139 @@ fn wrap_news_to_lines(
             .map(|(text, style)| (text.as_str(), *style))
             .unwrap_or(("", body_style));
         lines.push(Line::from(vec![
-            Span::styled("│", border_style),
+            pad.clone(),
             Span::styled(
-                pad_to_width(left, left_width),
+                pad_to_display_width(left, left_width),
                 Style::default().fg(theme::AMBER_DIM()),
             ),
             Span::styled(" │ ", border_style),
-            Span::styled(pad_to_width(right, right_width), right_style),
-            Span::styled("│", border_style),
+            Span::styled(pad_to_display_width(right, right_width), right_style),
         ]));
     }
-
-    lines.push(Line::from(Span::styled(
-        format!("└{}┘", "─".repeat(inner_width)),
-        border_style,
-    )));
+    lines.push(Line::from(vec![
+        pad,
+        Span::styled("─".repeat(inner_width), border_style),
+    ]));
     lines
 }
+
+// ── Room seat-joined card ───────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RoomSeatPayload {
+    pub title: String,
+    pub meta: String,
+    pub ascii_lines: Vec<String>,
+}
+
+pub(crate) fn parse_room_seat_payload(body: &str) -> Option<RoomSeatPayload> {
+    let raw = body
+        .trim_start()
+        .strip_prefix(ROOM_SEAT_MARKER)?
+        .trim_start();
+    let mut parts = raw.splitn(3, ROOM_SEAT_SEPARATOR);
+    let title = parts.next().unwrap_or_default().trim().to_string();
+    let meta = parts.next().unwrap_or_default().trim().to_string();
+    let ascii_field = parts.next().unwrap_or_default();
+    let ascii_lines = decode_escaped_field(ascii_field.trim_end())
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    Some(RoomSeatPayload {
+        title,
+        meta,
+        ascii_lines,
+    })
+}
+
+fn wrap_room_seat_to_lines(
+    stamp: &str,
+    prefix: &str,
+    width: usize,
+    author_style: Style,
+    payload: RoomSeatPayload,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let border_style = Style::default().fg(theme::BORDER());
+    let title_style = Style::default()
+        .fg(theme::AMBER())
+        .add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(theme::CHAT_BODY());
+    let meta_style = Style::default().fg(theme::TEXT_FAINT());
+    let card_style = Style::default().fg(theme::AMBER_DIM());
+    let pad = Span::raw(" ");
+
+    lines.push(Line::from(vec![
+        pad.clone(),
+        Span::styled(prefix.to_string(), author_style),
+        Span::styled(" took a seat ", Style::default().fg(theme::TEXT_DIM())),
+        Span::styled(stamp.to_string(), meta_style),
+    ]));
+
+    // Narrow-width fallback: skip the box, render a single info line.
+    if width < 18 {
+        let mut fallback = payload.title.clone();
+        if !payload.meta.is_empty() {
+            fallback.push_str(" — ");
+            fallback.push_str(&payload.meta);
+        }
+        lines.push(Line::from(vec![pad, Span::styled(fallback, body_style)]));
+        return lines;
+    }
+
+    let inner_width = width.saturating_sub(2).max(1);
+    let ascii_max_width = payload
+        .ascii_lines
+        .iter()
+        .map(|line| UnicodeWidthStr::width(line.as_str()))
+        .max()
+        .unwrap_or(0);
+    // Layout per row inside the box: " " + left[left_width] + "  " + right[right_width]
+    // → inner_width = 1 + left_width + 2 + right_width
+    let max_left = inner_width.saturating_sub(3 + 12);
+    let left_width = ascii_max_width.min(max_left);
+    let right_width = inner_width.saturating_sub(left_width + 3).max(1);
+
+    let mut right_rows: Vec<(String, Style)> = Vec::new();
+    for row in wrap_plain_display_width(&payload.title, right_width) {
+        right_rows.push((row, title_style));
+    }
+    if !payload.meta.is_empty() {
+        for row in wrap_plain_display_width(&payload.meta, right_width) {
+            right_rows.push((row, body_style));
+        }
+    }
+    for row in wrap_plain_display_width("open [3] Rooms to join", right_width) {
+        right_rows.push((row, meta_style));
+    }
+    if right_rows.is_empty() {
+        right_rows.push((payload.title.clone(), title_style));
+    }
+
+    let row_count = payload.ascii_lines.len().max(right_rows.len()).max(1);
+    for idx in 0..row_count {
+        let left = payload
+            .ascii_lines
+            .get(idx)
+            .map(String::as_str)
+            .unwrap_or("");
+        let (right, right_style) = right_rows
+            .get(idx)
+            .map(|(text, style)| (text.as_str(), *style))
+            .unwrap_or(("", body_style));
+        lines.push(Line::from(vec![
+            pad.clone(),
+            Span::styled(pad_to_display_width(left, left_width), card_style),
+            Span::styled(" │ ", border_style),
+            Span::styled(pad_to_display_width(right, right_width), right_style),
+        ]));
+    }
+    lines
+}
+
+// ── Reaction footer ─────────────────────────────────────────
 
 fn render_reaction_footer_lines(
     reactions: &[ChatMessageReactionSummary],
@@ -287,12 +434,86 @@ fn normalize_inline_text(text: &str) -> String {
 }
 
 fn truncate_to_width(text: &str, width: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= width {
+    if UnicodeWidthStr::width(text) <= width {
         return text.to_string();
     }
-    let mut out: String = chars.iter().take(width.saturating_sub(3)).collect();
+    if width == 0 {
+        return String::new();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > width.saturating_sub(3) {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
     out.push_str("...");
+    out
+}
+
+fn pad_to_display_width(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > width {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out.push_str(&" ".repeat(width.saturating_sub(used)));
+    out
+}
+
+fn wrap_plain_display_width(text: &str, width: usize) -> Vec<String> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    if width == 0 {
+        return vec![String::new()];
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut idx = 0;
+    while idx < chars.len() {
+        let mut end = idx;
+        let mut used = 0;
+        while end < chars.len() {
+            let ch_width = UnicodeWidthChar::width(chars[end]).unwrap_or(0);
+            if used > 0 && used + ch_width > width {
+                break;
+            }
+            used += ch_width;
+            end += 1;
+            if used >= width {
+                break;
+            }
+        }
+
+        let break_at = if end < chars.len() {
+            let mut pos = end;
+            while pos > idx && chars[pos - 1] != ' ' {
+                pos -= 1;
+            }
+            if pos > idx { pos } else { end.max(idx + 1) }
+        } else {
+            end
+        };
+        out.push(chars[idx..break_at].iter().collect());
+        idx = break_at;
+        while idx < chars.len() && chars[idx] == ' ' {
+            idx += 1;
+        }
+    }
     out
 }
 
@@ -306,20 +527,6 @@ fn split_summary_bullets(text: &str) -> Vec<String> {
             format!("• {stripped}")
         })
         .collect()
-}
-
-fn raw_ascii_preview_lines(ascii: &str, max_rows: usize) -> Vec<String> {
-    let mut rows: Vec<String> = ascii
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .take(max_rows)
-        .collect();
-    if rows.is_empty() {
-        rows.push("........".to_string());
-    }
-    rows
 }
 
 fn decode_escaped_field(input: &str) -> String {
@@ -372,14 +579,57 @@ mod tests {
     }
 
     #[test]
-    fn raw_ascii_preview_lines_limits_to_requested_rows() {
+    fn parse_news_payload_requires_marker_at_start() {
+        assert!(parse_news_payload("hello ---NEWS--- Fake || summary || url || ascii").is_none());
+        assert!(parse_news_payload("  ---NEWS--- Title || Summary || url || ascii").is_some());
+    }
+
+    #[test]
+    fn parse_room_seat_payload_splits_marker_payload() {
+        let body = "---ROOM-SEAT--- Poker · Night Table || 50/100 blinds || ╭───╮\\n╰───╯";
+        let payload = parse_room_seat_payload(body).expect("payload");
+        assert_eq!(payload.title, "Poker · Night Table");
+        assert_eq!(payload.meta, "50/100 blinds");
+        assert_eq!(
+            payload.ascii_lines,
+            vec!["╭───╮".to_string(), "╰───╯".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_room_seat_payload_requires_marker_at_start() {
+        assert!(parse_room_seat_payload("hello ---ROOM-SEAT--- Fake || meta || ascii").is_none());
+        assert!(
+            parse_room_seat_payload("  ---ROOM-SEAT--- Poker · Table || meta || ascii").is_some()
+        );
+    }
+
+    #[test]
+    fn format_news_ascii_art_for_display_limits_to_requested_rows() {
         let art = "abc\ndef\nghi\njkl";
-        let lines = raw_ascii_preview_lines(art, 2);
+        let lines = format_news_ascii_art_for_display(art, 2);
         assert_eq!(lines, vec!["abc".to_string(), "def".to_string()]);
     }
 
     #[test]
-    fn wrap_news_to_lines_renders_box_with_ascii_left() {
+    fn format_news_ascii_art_for_display_drops_blank_rows_and_trims_right_edge() {
+        let art = "\n   \n  abc  \n\\n def\t \n";
+        let lines = format_news_ascii_art_for_display(art, 6);
+        assert_eq!(lines, vec!["  abc".to_string(), " def".to_string()]);
+    }
+
+    #[test]
+    fn format_news_ascii_art_for_display_allows_short_or_empty_art() {
+        assert_eq!(
+            format_news_ascii_art_for_display("one\n\n", 6),
+            vec!["one".to_string()]
+        );
+        assert!(format_news_ascii_art_for_display("\n  \n", 6).is_empty());
+        assert!(format_news_ascii_art_for_display("one", 0).is_empty());
+    }
+
+    #[test]
+    fn wrap_news_to_lines_renders_rules_with_ascii_left() {
         let lines = wrap_news_to_lines(
             "[1m]",
             "mat: ",
@@ -403,14 +653,56 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        for row in lines_to_strings(&lines) {
+            assert!(
+                row.starts_with(' '),
+                "custom card row lost left padding: {row:?}"
+            );
+        }
         assert!(rendered.contains("shared news"));
-        assert!(rendered.contains("┌"));
-        assert!(rendered.contains("└"));
+        assert!(!rendered.contains("┌"));
+        assert!(!rendered.contains("┐"));
+        assert!(!rendered.contains("└"));
+        assert!(!rendered.contains("┘"));
+        assert!(rendered.contains("──"));
+        assert!(
+            rendered
+                .lines()
+                .filter(|line| line.trim().chars().all(|ch| ch == '─'))
+                .count()
+                >= 2
+        );
         assert!(rendered.contains(".:-"));
         assert!(rendered.contains(" │ "));
         assert!(rendered.contains("Title"));
         assert!(rendered.contains("first bullet"));
         assert!(rendered.contains("https://example.com"));
+    }
+
+    #[test]
+    fn wrap_news_to_lines_respects_terminal_cell_width() {
+        let width = 58;
+        let lines = wrap_news_to_lines(
+            "[4 mins ago]",
+            "@artboard",
+            width,
+            Style::default(),
+            NewsPayload {
+                title: "Nobody understands the point of hybrid cars".to_string(),
+                summary:
+                    "YouTube video by Technology Connections.\nOpen the link to watch on YouTube."
+                        .to_string(),
+                url: "https://www.youtube.com/watch?v=KnUFH5GX_fI".to_string(),
+                ascii_art: ".. .-:::----\n. .:==-.....\n:-:--:     .".to_string(),
+            },
+        );
+
+        for rendered in lines_to_strings(&lines) {
+            assert!(
+                UnicodeWidthStr::width(rendered.as_str()) <= width,
+                "line overflowed {width} cells: {rendered:?}"
+            );
+        }
     }
 
     #[test]
@@ -424,6 +716,7 @@ mod tests {
             Style::default(),
             false,
             false,
+            None,
             &[
                 ChatMessageReactionSummary { kind: 2, count: 3 },
                 ChatMessageReactionSummary { kind: 5, count: 1 },
